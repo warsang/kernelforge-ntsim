@@ -1,0 +1,19 @@
+{
+  "name": "@kernelforge/ntsim-assets",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "scrape": "node scripts/scrape-vergilius.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "CC0-1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/warsang/kernelforge-ntsim.git"
+  },
+  "author": "warsang"
+}

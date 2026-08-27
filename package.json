@@ -1,0 +1,11 @@
+{
+  "name": "kernelforge-ntsim-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "test": "node --test packages/*/test/*.test.mjs",
+    "typecheck": "tsc --build"
+  },
+  "devDependencies": { "typescript": "^5.5.4" }
+}

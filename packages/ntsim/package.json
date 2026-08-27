@@ -1,0 +1,23 @@
+{
+  "name": "@kernelforge/ntsim",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./src/*": "./src/*"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/warsang/kernelforge-ntsim.git"
+  },
+  "author": "warsang"
+}
