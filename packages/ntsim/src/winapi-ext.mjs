@@ -16,10 +16,14 @@
 import {
   createDriverObject,
   createDeviceObject,
+  completeIrp,
+  initMdl,
   DEVICE_OBJECT,
   DRIVER_OBJECT,
   IRP,
   IO_STACK_LOCATION,
+  MDL,
+  SL_INVOKE,
 } from "./devices.mjs";
 
 const STATUS_SUCCESS = 0x00000000n;
@@ -126,10 +130,24 @@ export function installWinApiExt(kernel, ctx) {
   k.define("PoCallDriver", (...a) => impls.IofCallDriver(...a));
 
   k.define("IoAttachDeviceToDeviceStack", (srcDev, tgtDev) => {
-    mem.w64(srcDev + BigInt(DEVICE_OBJECT.ATTACHED_DEVICE), ptrSizeMask(tgtDev));
-    return srcDev; // approximation: real returns the layer attached TO
+    const src = ptrSizeMask(srcDev);
+    const tgt = ptrSizeMask(tgtDev);
+    // Real contract: return the device at the TOP of the target's stack and
+    // link src->AttachedDevice to the previous top (chains preserve order).
+    const prevTop = tgt ? (mem.u64(tgt + BigInt(DEVICE_OBJECT.ATTACHED_DEVICE)) || tgt) : tgt;
+    if (src) mem.w64(src + BigInt(DEVICE_OBJECT.ATTACHED_DEVICE), prevTop);
+    return prevTop || src;
   });
-  k.define("IoDetachDevice", () => undefined);
+  k.define("IoDetachDevice", (tgtDev) => {
+    const tgt = ptrSizeMask(tgtDev);
+    if (tgt) mem.w64(tgt + BigInt(DEVICE_OBJECT.ATTACHED_DEVICE), 0n);
+    return undefined;
+  });
+  k.define("IoGetAttachedDeviceReference", (devObj) => {
+    const dev = ptrSizeMask(devObj);
+    const attached = dev ? mem.u64(dev + BigInt(DEVICE_OBJECT.ATTACHED_DEVICE)) : 0n;
+    return attached || dev;
+  });
 
   k.define("IoMarkIrpPending", (irp) => {
     const stack = ptrSizeMask(irp) ? mem.u64(irp + BigInt(IRP.CURRENT_STACK_LOCATION)) : 0n;
@@ -153,21 +171,41 @@ export function installWinApiExt(kernel, ctx) {
     mem.w64(irp + BigInt(IRP.CURRENT_STACK_LOCATION), next);
     return undefined;
   });
-  k.define("IoSetCompletionRoutine", () => undefined); // guest writes slots directly
+  /**
+   * Record a completion routine in the current stack location, exactly like
+   * the WDK helper: routine/context at +0x38/+0x40 and the SL_INVOKE bits in
+   * Control. Drivers that poke the slots directly still work (same layout).
+   */
+  k.define("IoSetCompletionRoutine", (irp, routine, context, onSuccess, onError, onCancel) => {
+    const irpVa = ptrSizeMask(irp);
+    if (!irpVa) return undefined;
+    const sl = mem.u64(irpVa + BigInt(IRP.CURRENT_STACK_LOCATION));
+    if (!sl) return undefined;
+    mem.w64(sl + BigInt(IO_STACK_LOCATION.COMPLETION_ROUTINE), ptrSizeMask(routine));
+    mem.w64(sl + BigInt(IO_STACK_LOCATION.CONTEXT), ptrSizeMask(context));
+    let control = mem.u8(sl + BigInt(IO_STACK_LOCATION.CONTROL)) & ~0xe0;
+    if (onSuccess) control |= SL_INVOKE.ON_SUCCESS;
+    if (onError) control |= SL_INVOKE.ON_ERROR;
+    if (onCancel) control |= SL_INVOKE.ON_CANCEL;
+    mem.w8(sl + BigInt(IO_STACK_LOCATION.CONTROL), control);
+    return undefined;
+  });
 
-  k.define("IoAllocateIrp", (stackSize) => k.alloc(IRP.HEADER_SIZE + Number(stackSize ?? 1) * IRP.STACK_SIZE));
+  k.define("IoAllocateIrp", (stackSize) => {
+    const n = Number(stackSize ?? 1) || 1;
+    const irp = k.alloc(IRP.HEADER_SIZE + n * IRP.STACK_SIZE);
+    mem.write(irp, new Uint8Array(IRP.HEADER_SIZE + n * IRP.STACK_SIZE));
+    mem.w16(irp + BigInt(IRP.TYPE), 0x0006);
+    mem.w8(irp + BigInt(IRP.STACK_COUNT), n);
+    mem.w8(irp + BigInt(IRP.CURRENT_LOCATION), n);
+    mem.w64(irp + BigInt(IRP.CURRENT_STACK_LOCATION),
+      irp + BigInt(IRP.HEADER_SIZE + (n - 1) * IRP.STACK_SIZE));
+    return irp;
+  });
   k.define("IoFreeIrp", () => undefined);
 
   k.define("IoCompleteRequest", (irp, priority) => {
-    void priority;
-    if (irp) {
-      // record, don't clobber: driver already wrote IoStatus
-      kernel.lastCompletedIrp = {
-        va: ptrSizeMask(irp),
-        status: mem.u32(irp + BigInt(IRP.IO_STATUS_STATUS)),
-        information: mem.u64(irp + BigInt(IRP.IO_STATUS_INFORMATION)),
-      };
-    }
+    if (irp) completeIrp(kernel, ptrSizeMask(irp), priority ?? 0);
     return undefined;
   });
   // IofCompleteRequest is the fastcall export drivers actually link against.
@@ -175,15 +213,74 @@ export function installWinApiExt(kernel, ctx) {
 
   k.define("IoAllocateMdl", (virtAddr, len, secondary, chargeQuota, irp) => {
     void chargeQuota;
-    const mdl = k.alloc(0x40);
-    mem.w64(mdl + 0x08, ptrSizeMask(virtAddr));
-    mem.w32(mdl + 0x10, Number(len));
-    if (irp && !secondary) mem.w64(irp + IRP.MDL_ADDRESS, mdl);
+    const pages = Math.max(1, Math.ceil(Number(len) / 0x1000));
+    const mdl = k.alloc(MDL.PFN_ARRAY + pages * 8);
+    initMdl(mem, mdl, virtAddr, Number(len), 0);
+    if (irp && !secondary) mem.w64(ptrSizeMask(irp) + BigInt(IRP.MDL_ADDRESS), mdl);
+    kernel.mdlMaps = kernel.mdlMaps ?? new Map();
+    kernel.mdlMaps.set(mdl, { base: ptrSizeMask(virtAddr), size: Number(len), locked: false, systemVa: 0n });
     return mdl;
   });
-  k.define("IoFreeMdl", () => undefined);
-  k.define("MmProbeAndLockPages", () => STATUS_SUCCESS);
-  k.define("MmUnlockPages", () => undefined);
+  k.define("IoFreeMdl", (mdl) => {
+    kernel.mdlMaps?.delete(ptrSizeMask(mdl));
+    return undefined;
+  });
+  k.define("MmProbeAndLockPages", (mdl, _access, _operation) => {
+    const m = kernel.mdlMaps?.get(ptrSizeMask(mdl));
+    if (m) m.locked = true;
+    const flags = mem.u16(mdl + BigInt(MDL.FLAGS));
+    mem.w16(mdl + BigInt(MDL.FLAGS), flags | MDL.FLAG_PAGES_LOCKED);
+    fillMdlsPfns(mdl);
+    return STATUS_SUCCESS;
+  });
+  k.define("MmUnlockPages", (mdl) => {
+    const m = kernel.mdlMaps?.get(ptrSizeMask(mdl));
+    if (m) m.locked = false;
+    const flags = mem.u16(mdl + BigInt(MDL.FLAGS));
+    mem.w16(mdl + BigInt(MDL.FLAGS), flags & ~MDL.FLAG_PAGES_LOCKED);
+    return undefined;
+  });
+  k.define("MmBuildMdlForNonPagedPool", (mdl) => {
+    const flags = mem.u16(mdl + BigInt(MDL.FLAGS));
+    mem.w16(mdl + BigInt(MDL.FLAGS), flags | MDL.FLAG_SOURCE_IS_NONPAGED_POOL);
+    fillMdlsPfns(mdl);
+    return undefined;
+  });
+  k.define("MmGetMdlVirtualAddress", (mdl) => {
+    const start = mem.u64(mdl + BigInt(MDL.START_VA));
+    const offset = mem.u32(mdl + BigInt(MDL.BYTE_OFFSET));
+    return start + BigInt(offset);
+  });
+  k.define("MmGetMdlByteCount", (mdl) => BigInt(mem.u32(mdl + BigInt(MDL.BYTE_COUNT))));
+  k.define("MmGetSystemAddressForMdlSafe", (mdl, _priority) => {
+    const mdlVa = ptrSizeMask(mdl);
+    if (!mdlVa) return 0n;
+    const mapped = mem.u64(mdlVa + BigInt(MDL.MAPPED_SYSTEM_VA));
+    const start = mem.u64(mdlVa + BigInt(MDL.START_VA));
+    const byteOffset = BigInt(mem.u32(mdlVa + BigInt(MDL.BYTE_OFFSET)));
+    if (mapped) return mapped;
+    // Alias the virtual address: emulated memory is shared, so the driver's
+    // writes are immediately visible to the requester's buffer.
+    const alias = start + byteOffset;
+    mem.w64(mdlVa + BigInt(MDL.MAPPED_SYSTEM_VA), alias);
+    const flags = mem.u16(mdlVa + BigInt(MDL.FLAGS));
+    mem.w16(mdlVa + BigInt(MDL.FLAGS), flags | MDL.FLAG_MAPPED_TO_SYSTEM_VA);
+    const m = kernel.mdlMaps?.get(mdlVa);
+    if (m) m.systemVa = alias;
+    return alias;
+  });
+
+  /** Fill the MDL PFN array with deterministic "physical" page numbers. */
+  function fillMdlsPfns(mdl) {
+    const start = mem.u64(mdl + BigInt(MDL.START_VA));
+    const count = Number(mem.u32(mdl + BigInt(MDL.BYTE_COUNT)));
+    const pages = Math.max(1, Math.ceil(count / 0x1000));
+    for (let i = 0; i < pages; i++) {
+      // shared physical model: PA = VA >> 12 (consistent with MmGetPhysical*)
+      const pa = kernel.vaToPa ? kernel.vaToPa(start) : (start >> 12n);
+      mem.w64(mdl + BigInt(MDL.PFN_ARRAY) + BigInt(i * 8), pa + BigInt(i));
+    }
+  }
 
   // ---------------------------------------------------------- work items
 
@@ -381,23 +478,28 @@ export function installWinApiExt(kernel, ctx) {
   // the routine to satisfy the linker. Keep it callable and harmless.
   k.define("__C_specific_handler", () => 0n);
 
-  // OB_CALLBACK_REGISTRATION:
-  //   +0x00 u16 Version, +0x02 u16 OperationRegistrationCount, +pad
-  //   +0x08 UNICODE_STRING Altitude, +0x18 pad, +0x20 void* RegistrationContext,
-  //   +0x28 OB_OPERATION_REGISTRATION* (ObjectType, PreOp, PostOp triplets)
+  // OB_CALLBACK_REGISTRATION (x64):
+  //   +0x00 u16 Version, +0x02 u16 OperationRegistrationCount
+  //   +0x08 UNICODE_STRING Altitude (16 bytes)
+  //   +0x18 void* RegistrationContext
+  //   +0x20 OB_OPERATION_REGISTRATION* — 0x20 stride:
+  //        { ObjectType** POBJECT_TYPE* @0, OB_OPERATION Operations @8,
+  //          PreOperation @0x10, PostOperation @0x18 }
   kernel.obCallbacks = kernel.obCallbacks ?? [];
   k.define("ObRegisterCallbacks", (cbReg) => {
     cbReg = ptrSizeMask(cbReg);
     if (!cbReg) return STATUS_INVALID_PARAMETER;
     const count = mem.u16(cbReg + 2n);
     const altitude = usRead(mem, cbReg + 8n).str;
-    const opsBase = mem.u64(cbReg + 0x28n);
+    const opsBase = mem.u64(cbReg + 0x20n);
     const entries = [];
     for (let i = 0; i < Math.min(count, 8); i++) {
+      const at = opsBase + BigInt(i * 0x20);
       entries.push({
-        objectType: mem.u64(opsBase + BigInt(i * 24)),
-        preOp: mem.u64(opsBase + BigInt(i * 24 + 8)),
-        postOp: mem.u64(opsBase + BigInt(i * 24 + 16)),
+        objectType: mem.u64(at),
+        operations: mem.u32(at + 8n),
+        preOp: mem.u64(at + 0x10n),
+        postOp: mem.u64(at + 0x18n),
       });
     }
     kernel.obCallbacks.push({ registration: cbReg, altitude, entries });
@@ -641,26 +743,38 @@ export function installWinApiExt(kernel, ctx) {
   k.define("ZwOpenSection", (handleOut, access, objAttr) => {
     void access;
     const p = pathFromObjAttr(objAttr);
-    if (!kernel.sections.has(p)) return STATUS_OBJECT_NAME_NOT_FOUND;
+    // \Device\PhysicalMemory always opens (drivers map it to inspect RAM)
+    const isPhysical = /^\\device\\physicalmemory$/i.test(p);
+    if (!isPhysical && !kernel.sections.has(p)) return STATUS_OBJECT_NAME_NOT_FOUND;
     const h = sectionSeq++;
-    kernel.handles.set(h, { __section: p });
+    kernel.handles.set(h, { __section: p, __physical: isPhysical });
     mem.w64(handleOut, h);
     return STATUS_SUCCESS;
   });
   k.define("ZwMapViewOfSection", (handle, process, baseOut, zeroBits, commitSize, offsetPtr, viewSizePtr, inherit, alloc, prot) => {
     void process; void zeroBits; void offsetPtr; void inherit; void alloc; void prot;
-    const p = kernel.handles.get(ptrSizeMask(handle))?.__section;
+    const rec = kernel.handles.get(ptrSizeMask(handle));
+    const p = rec?.__section;
     if (!p) return STATUS_INVALID_PARAMETER;
-    const data = kernel.sections.get(p) ?? new Uint8Array(0);
+    const data = rec.__physical ? new Uint8Array(0) : (kernel.sections.get(p) ?? new Uint8Array(0));
     const want = viewSizePtr ? Number(mem.u64(viewSizePtr)) : 0;
-    const n = Math.max(Math.min(Number(commitSize ?? 0n), data.length), Math.min(want, data.length), 1);
+    const n = rec.__physical
+      ? Math.max(Math.min(want || Number(commitSize ?? 0n) || 0x1000, 0x100000), 0x1000)
+      : Math.max(Math.min(Number(commitSize ?? 0n), data.length), Math.min(want, data.length), 1);
     const va = k.alloc(n);
     mem.write(va, data.subarray(0, n));
+    kernel.sectionViews = kernel.sectionViews ?? new Map();
+    kernel.sectionViews.set(va, n);
     mem.w64(baseOut, va);
     if (viewSizePtr) mem.w64(viewSizePtr, BigInt(n));
+    kernel.dbgLog.push(`[section] mapped ${p} size=0x${n.toString(16)} @ 0x${va.toString(16)}`);
     return STATUS_SUCCESS;
   });
-  k.define("ZwUnmapViewOfSection", () => STATUS_SUCCESS);
+  k.define("ZwUnmapViewOfSection", (_process, base) => {
+    const va = ptrSizeMask(base);
+    if (va) kernel.sectionViews?.delete(va);
+    return STATUS_SUCCESS;
+  });
 
   // ---------------------------------------------------- interlocked (64)
 
@@ -782,9 +896,18 @@ export function installWinApiExt(kernel, ctx) {
     return undefined;
   });
   k.define("KfIoWrite32", (port, value) => { ioLog("outd", "32", port, value); return undefined; });
+  // Physical -> VA mapping (KEVLAR: PA*0x1000; the local APIC page returns 0
+  // like a failed mapping so anti-VM probes don't observe a firmware alias).
   k.define("MmMapIoSpace", (physAddr, numberOfBytes) => {
     void numberOfBytes;
-    return physAddr ? BigInt(physAddr) : 0n;
+    const pa = ptrSizeMask(physAddr);
+    if (!pa) return 0n;
+    if (pa >= 0xfee00000n && pa < 0xfee01000n) return 0n; // local APIC
+    return kernel.paToVa ? kernel.paToVa(pa) : (pa << 12n);
+  });
+  k.define("MmMapIoSpaceEx", (physAddr, numberOfBytes, protect) => {
+    void protect;
+    return impls.MmMapIoSpace(physAddr, numberOfBytes);
   });
   k.define("MmUnmapIoSpace", (_base, _len) => undefined);
 
@@ -1199,16 +1322,63 @@ export function installWinApiExt(kernel, ctx) {
   });
   k.define("MmAllocateContiguousMemory", (size) => k.alloc(Number(size)));
   k.define("MmFreeContiguousMemory", () => undefined);
-  k.define("MmGetPhysicalMemoryRanges", () => k.alloc(0x100)); // opaque ranges blob
-  k.define("MmMapLockedPagesSpecifyCache", (mdl, _mode, _cache, _base, _bugcheck, _priority) => {
-    const va = k.alloc(0x1000);
-    const sysVa = mem.u64(mdl + 0x08);
-    if (sysVa) mem.write(va, mem.read(sysVa, 0x1000));
-    return va;
+  // PHYSICAL_MEMORY_RANGE[]: {LARGE_INTEGER BaseAddress; LARGE_INTEGER Length}
+  // terminated by a zeroed entry. Two ranges, like a real machine with a
+  // low-memory hole.
+  k.define("MmGetPhysicalMemoryRanges", () => {
+    const table = k.alloc(0x30);
+    mem.write(table, new Uint8Array(0x30));
+    mem.w64(table, 0x1000n);                    // BaseAddress
+    mem.w64(table + 8n, 0x9f000n);              // Length (low memory)
+    mem.w64(table + 0x10n, 0x100000n);          // BaseAddress (high memory)
+    mem.w64(table + 0x18n, 0x1fff00000n);       // Length (~8 GB)
+    return table;
   });
-  k.define("MmUnmapLockedPages", () => undefined);
-  k.define("MmBuildMdlForNonPagedPool", () => undefined);
-  k.define("MmGetMdlVirtualAddress", (mdl) => mem.u64(mdl + 0x08));
+  // KEVLAR identity physical model: PA is the page number (VA >> 12).
+  k.define("MmGetPhysicalAddress", (va) => kernel.vaToPa
+    ? kernel.vaToPa(ptrSizeMask(va))
+    : (ptrSizeMask(va) >> 12n));
+  k.define("MmGetVirtualForPhysical", (pa) => kernel.paToVa
+    ? kernel.paToVa(ptrSizeMask(pa))
+    : (ptrSizeMask(pa) << 12n));
+  k.define("MmGetMdlPfnArray", (mdl) => ptrSizeMask(mdl) ? ptrSizeMask(mdl) + BigInt(MDL.PFN_ARRAY) : 0n);
+  k.define("MmGetMdlByteOffset", (mdl) => BigInt(mem.u32(ptrSizeMask(mdl) + BigInt(MDL.BYTE_OFFSET))));
+  k.define("MmMapLockedPagesSpecifyCache", (mdl, mode, _cache, _base, _bugcheck, _priority) => {
+    const mdlVa = ptrSizeMask(mdl);
+    if (!mdlVa) return 0n;
+    // Shared-memory alias: kernel/user mode only affects the returned VA class.
+    const start = mem.u64(mdlVa + BigInt(MDL.START_VA));
+    const byteOffset = mem.u32(mdlVa + BigInt(MDL.BYTE_OFFSET));
+    const mapped = start + BigInt(byteOffset);
+    mem.w64(mdlVa + BigInt(MDL.MAPPED_SYSTEM_VA), mapped);
+    const flags = mem.u16(mdlVa + BigInt(MDL.FLAGS));
+    mem.w16(mdlVa + BigInt(MDL.FLAGS), flags | MDL.FLAG_MAPPED_TO_SYSTEM_VA);
+    const m = kernel.mdlMaps?.get(mdlVa);
+    if (m) m.systemVa = mapped;
+    void mode;
+    return mapped;
+  });
+  k.define("MmUnmapLockedPages", (mdl) => {
+    const mdlVa = ptrSizeMask(mdl);
+    if (mdlVa) {
+      mem.w64(mdlVa + BigInt(MDL.MAPPED_SYSTEM_VA), 0n);
+      const flags = mem.u16(mdlVa + BigInt(MDL.FLAGS));
+      mem.w16(mdlVa + BigInt(MDL.FLAGS), flags & ~MDL.FLAG_MAPPED_TO_SYSTEM_VA);
+    }
+    return undefined;
+  });
+
+  // ------------------------------------------------ IRP stack-location helpers
+  k.define("IoGetCurrentIrpStackLocation", (irp) => {
+    const irpVa = ptrSizeMask(irp);
+    return irpVa ? mem.u64(irpVa + BigInt(IRP.CURRENT_STACK_LOCATION)) : 0n;
+  });
+  k.define("IoGetNextIrpStackLocation", (irp) => {
+    const irpVa = ptrSizeMask(irp);
+    if (!irpVa) return 0n;
+    const cur = mem.u64(irpVa + BigInt(IRP.CURRENT_STACK_LOCATION));
+    return cur ? cur - BigInt(IRP.STACK_SIZE) : 0n;
+  });
   k.define("MmCopyVirtualMemory", (srcProc, src, dstProc, dst, size, mode, outLen) => {
     void srcProc; void dstProc; void mode;
     mem.write(dst, mem.read(src, Number(size)));

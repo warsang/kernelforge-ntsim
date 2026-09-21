@@ -39,6 +39,13 @@
  *   #DB / EXCEPTION_SINGLE_STEP sink invoked by run() after an instruction
  *   executes with TF armed. Return true = handled (execution continues
  *   seamlessly); false/absent = run() stops with "breakpoint" at the trap.
+ * @property {(leaf: bigint, subleaf: bigint) => {eax?: bigint, ebx?: bigint,
+ *   ecx?: bigint, edx?: bigint}} [onCpuid] CPUID virtualization
+ *   (arch.mjs); absent = honest "unimplemented 0f opcode" fault.
+ * @property {(msr: bigint) => bigint} [onRdmsr] RDMSR virtualization.
+ * @property {(msr: bigint, value: bigint) => void} [onWrmsr] WRMSR virtualization.
+ * @property {() => bigint} [onRdtsc] RDTSC virtualization; absent = the
+ *   deterministic steps*100 tick.
  */
 
 const R64 = [
@@ -53,6 +60,13 @@ const M64 = 0xffffffffffffffffn;
 function sx(v, bits) {
   const sign = 1n << BigInt(bits - 1);
   return ((v & (sign - 1n)) - (v & sign)) & M64;
+}
+
+/** x86 parity flag: true when the low result byte has even popcount. */
+function evenParity8(v) {
+  let p = Number(BigInt(v) & 0xffn);
+  p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+  return (p & 1) === 0;
 }
 
 export class CpuError extends Error {
@@ -72,7 +86,7 @@ export class JsInterpreter {
     this.regs = {};
     for (const r of R64) this.regs[r] = 0n;
     this.rip = 0n;
-    this.cf = this.zf = this.sf = this.of = false;
+    this.cf = this.zf = this.sf = this.of = this.pf = false;
     this.df = false;
     /** trap flag (RFLAGS.TF, bit 8): arms hardware single-step */
     this.tf = false;
@@ -103,6 +117,18 @@ export class JsInterpreter {
      */
     this.breakpointPolicy = "continue";
     /**
+     * Architectural-insn hooks (arch.mjs installs these for anti-emulation
+     * fidelity). Each is optional: when absent the legacy honest-fault /
+     * deterministic-tick behavior is preserved.
+     *   onCpuid(leaf, subleaf) -> {eax?,ebx?,ecx?,edx?}
+     *   onRdmsr(msr) -> bigint          onWrmsr(msr, value) -> void
+     *   onRdtsc() -> bigint             (replaces the steps*100 model)
+     */
+    this.onCpuid = null;
+    this.onRdmsr = null;
+    this.onWrmsr = null;
+    this.onRdtsc = null;
+    /**
      * Debugger software-breakpoint gate: addresses checked BEFORE fetch.
      * A hit parks RIP on the address (nothing executes) and behaves exactly
      * like an executed int3: pendingBreak -> run()=="breakpoint". Memory is
@@ -122,6 +148,13 @@ export class JsInterpreter {
     this.efer = 0x0000000000000500n;
     this.onDebugException = null;
     this.lastDebugStop = null;
+    /**
+     * Segment selectors (ES CS SS DS FS GS) as 16-bit values. The interpreter
+     * never walks descriptors — flat model — but drivers do read selectors
+     * (e.g. `mov [mem], gs` in CRT/GS-cookie code, opcode 0x8C) and compare
+     * them later, so keep consistent Windows-x64-typical values.
+     */
+    this.sregs = [0x2bn, 0x10n, 0x18n, 0x2bn, 0x53n, 0x2bn];
   }
 
   reset(rip) {
@@ -134,6 +167,7 @@ export class JsInterpreter {
     this.iflag = true;
     this.inhibitWindow = 0;
     this.lastDebugStop = null;
+    this.sregs = [0x2bn, 0x10n, 0x18n, 0x2bn, 0x53n, 0x2bn];
   }
 
   /**
@@ -144,6 +178,7 @@ export class JsInterpreter {
   composeFlags() {
     let f = 0x2n | 0x200n; // reserved bit1 + IF
     if (this.cf) f |= 0x1n;
+    if (this.pf) f |= 0x4n;
     if (this.zf) f |= 0x40n;
     if (this.sf) f |= 0x80n;
     if (this.tf) f |= 0x100n;
@@ -157,6 +192,7 @@ export class JsInterpreter {
   loadFlags(v) {
     v = BigInt(v);
     this.cf = (v & 0x1n) !== 0n;
+    this.pf = (v & 0x4n) !== 0n;
     this.zf = (v & 0x40n) !== 0n;
     this.sf = (v & 0x80n) !== 0n;
     this.tf = (v & 0x100n) !== 0n;
@@ -205,8 +241,11 @@ export class JsInterpreter {
       case 4: return full & 0xffffffffn;
       case 2: return full & 0xffffn;
       case 1: {
-        // rex prefix distinguishes sil/dil/bpl/spl vs ah/ch/dh/bh; we support
-        // only low-byte access (compiled C rarely touches high bytes at O1/O2).
+        // Without a REX prefix, byte indices 4-7 address AH/CH/DH/BH
+        // (bits 8-15 of rax/rcx/rdx/rbx); with REX they are spl/bpl/sil/dil.
+        if (!this.rexByte && idx >= 4 && idx < 8) {
+          return (this.regs[R64[idx - 4]] >> 8n) & 0xffn;
+        }
         return full & 0xffn;
       }
       default: throw new Error("bad size");
@@ -215,6 +254,11 @@ export class JsInterpreter {
 
   writeReg(idx, size, val) {
     val = BigInt(val);
+    if (size === 1 && !this.rexByte && idx >= 4 && idx < 8) {
+      const name = R64[idx - 4]; // AH/CH/DH/BH
+      this.regs[name] = (this.regs[name] & ~(0xffn << 8n)) | ((val & 0xffn) << 8n);
+      return;
+    }
     const name = R64[idx];
     const cur = this.regs[name];
     switch (size) {
@@ -356,6 +400,7 @@ export class JsInterpreter {
     r &= mask;
     this.zf = r === 0n;
     this.sf = (r & signBit) !== 0n;
+    this.pf = evenParity8(r);
     this.of =
       op === "add" ? ((a & signBit) === (b & signBit) && (r & signBit) !== (a & signBit))
       : ["sub", "cmp"].includes(op) ? ((a & signBit) !== (b & signBit) && (r & signBit) !== (a & signBit))
@@ -375,8 +420,8 @@ export class JsInterpreter {
       case 0x7: return !this.cf && !this.zf;       // a
       case 0x8: return this.sf;                    // s
       case 0x9: return !this.sf;                   // ns
-      case 0xa: return this.of !== this.sf;        // p (approximated as parity-less)
-      case 0xb: return this.of === this.sf;
+      case 0xa: return this.pf;                    // p (parity of low result byte)
+      case 0xb: return !this.pf;                   // np
       case 0xc: return this.zf || (this.sf !== this.of); // le
       case 0xd: return !this.zf && (this.sf === this.of); // g
       case 0xe: return this.zf || (this.sf !== this.of);
@@ -412,12 +457,12 @@ export class JsInterpreter {
     this.rexByte = 0;
 
     // prefixes
-    let rex = 0, opsize = 4, rep = null;
+    let rex = 0, opsize = 4, rep = null, addr16 = false;
     for (;;) {
       const p = this.fetch8();
       if (p === 0xf0) continue; // lock prefix — single-threaded, ignore
       if (p === 0x66) { opsize = 2; continue; }
-      if (p === 0x67) continue; // addr-size: ignore (flat model)
+      if (p === 0x67) { addr16 = true; continue; } // addr-size: only jrcxz cares
       if (p === 0xf2) { rep = "repnz"; continue; }
       if (p === 0xf3) { rep = "rep"; continue; }
       if (p >= 0x40 && p <= 0x4f) {
@@ -432,12 +477,12 @@ export class JsInterpreter {
       if (p === 0x2e || p === 0x36 || p === 0x3e || p === 0x26 || p === 0x64 || p === 0x65) continue; // seg overrides ignored
       // not a prefix
       this.opcodeStart = this.rip - 1n;
-      this.dispatch(p, { rex, opsize, rep });
+      this.dispatch(p, { rex, opsize, rep, addr16 });
       return startRip;
     }
   }
 
-  dispatch(p, { rex, opsize, rep }) {
+  dispatch(p, { rex, opsize, rep, addr16 }) {
     const rexB = (rex & 1) !== 0;
     const rexX = (rex & 2) !== 0;
     this.rexB = rexB;
@@ -505,6 +550,12 @@ export class JsInterpreter {
       case p === 0xe9: {
         const rel = this.fetchImmSx(4);
         this.rip = (this.rip + rel) & M64;
+        return;
+      }
+      case p === 0xe3: { // jrcxz/jecxz rel8 — RCX (ECX with 0x67) is zero
+        const rel = this.fetchImmSx(1);
+        const v = this.readReg(1, addr16 ? 4 : 8);
+        if (v === 0n) this.rip = (this.rip + rel) & M64;
         return;
       }
       case (p & 0xf0) === 0x70: {
@@ -665,6 +716,16 @@ export class JsInterpreter {
       return;
     }
 
+    // 8F /0: pop r/m64 — only /0 is valid (a 64-bit pop; no 16-bit form
+    // in 64-bit mode). Anti-debug stubs use `pop [rsp+disp]` after pushfq
+    // to snapshot RFLAGS to memory.
+    if (p === 0x8f) {
+      const { reg, rm } = this.decodeModrm(8);
+      if (reg !== 0) throw new CpuError(`unimplemented grp1a /${reg}`, this.opcodeStart);
+      this.storeOp(rm, 8, this.popVal());
+      return;
+    }
+
     // FE/FF grp5: inc/dec/call/jmp/push r/m
     if (p === 0xfe || p === 0xff) {
       const size = p === 0xfe ? 1 : opsize;
@@ -738,7 +799,14 @@ export class JsInterpreter {
       this.writeReg(reg, size, this.loadOp(rm, size));
       return;
     }
-    // 8c/8d lea
+    // 8c: mov r/m16, Sreg — in 64-bit mode the operand is always 16 bits
+    // (REX.W ignored). reg field encodes ES=0 CS=1 SS=2 DS=3 FS=4 GS=5.
+    if (p === 0x8c) {
+      const { reg, rm } = this.decodeModrm(2);
+      this.storeOp(rm, 2, this.sregs[reg & 7] ?? 0n);
+      return;
+    }
+    // 8d: lea
     if (p === 0x8d) {
       const { reg, rm } = this.decodeModrm(opsize);
       // LEA uses the effective address itself — resolve any pending RIP-rel
@@ -746,11 +814,12 @@ export class JsInterpreter {
       this.writeReg(reg, opsize, rm.kind === "mem" ? rm.addr : this.readReg(reg, opsize));
       return;
     }
-    // 8e: mov sreg, r/m16 — modeled only for its debug-inhibit side effect.
+    // 0x8e: mov sreg, r/m16 — record the selector for later 0x8c reads.
     // reg field encodes ES=0 CS=1 SS=2 DS=3 FS=4 GS=5; MOV to SS opens the
     // one-instruction interrupt/debug-exception suppression window.
     if (p === 0x8e) {
-      const { reg } = this.decodeModrm(2);
+      const { reg, rm } = this.decodeModrm(2);
+      this.sregs[reg & 7] = this.loadOp(rm, 2) & 0xffffn;
       if (reg === 2) this.inhibitWindow = 2;
       return;
     }
@@ -779,9 +848,15 @@ export class JsInterpreter {
       return;
     }
     if ((p >= 0xb0 && p <= 0xb7) || (p >= 0xb8 && p <= 0xbf)) {
-      if (p >= 0xb8) { // mov r64, imm64 (with REX.W) / imm32
+      if (p >= 0xb8) { // mov r, imm (REX.W: imm64, 0x66: imm16, else imm32)
         const idx = p - 0xb8 + (rexB ? 8 : 0);
-        this.regs[R64[idx]] = rex & 8 ? this.fetch(8) : this.fetch(4);
+        if (opsize === 2) {
+          // 16-bit form: 2-byte immediate, upper register bits preserved
+          // (unlike the 32-bit form, which zero-extends)
+          this.regs[R64[idx]] = (this.regs[R64[idx]] & ~0xffffn) | this.fetch(2);
+        } else {
+          this.regs[R64[idx]] = rex & 8 ? this.fetch(8) : this.fetch(4);
+        }
         return;
       }
       // b0-b7: mov r8, imm8
@@ -796,17 +871,40 @@ export class JsInterpreter {
       const names = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"];
       const size = (p & 1) === 0 ? 1 : opsize;
       const { reg, rm } = this.decodeModrm(size);
-      // count source: imm8 (c0/c1), literal 1 (d0/d1), or %cl masked to 5 bits
+      // count source: imm8 (c0/c1), literal 1 (d0/d1), or %cl.
+      // x86 masks the count to 5 bits for 8/16/32-bit operands but to
+      // 6 bits for 64-bit operands (so `shr rcx, 0x20` really shifts 32).
+      const countMask = size === 8 ? 0x3f : 0x1f;
       let count;
-      if (p === 0xc0 || p === 0xc1) count = Number(this.fetch8()) & 0x1f;
-      else if (p >= 0xd2) count = Number(this.readReg(1, 1)) & 0x1f;
+      if (p === 0xc0 || p === 0xc1) count = Number(this.fetch8()) & countMask;
+      else if (p >= 0xd2) count = Number(this.readReg(1, 1)) & countMask;
       else count = 1;
       const a = BigInt.asUintN(Number(size * 8), this.loadOp(rm, size));
       const bits = BigInt(size * 8);
       const mask = (1n << bits) - 1n;
       const signBit = 1n << (bits - 1n);
       let r = a;
+      // ROL/ROR leave ZF/SF (and AF/PF) untouched — only CF, and OF on
+      // 1-bit rotates. (They used to be accidental NOPs, which desynced
+      // rotation-heavy unpacker stubs.)
+      let noSZ = names[reg] === "rol" || names[reg] === "ror";
       switch (names[reg]) {
+        case "rol": {
+          const c = count % Number(bits);
+          if (c === 0) break;
+          r = ((a << BigInt(c)) | (a >> (bits - BigInt(c)))) & mask;
+          this.cf = ((a >> (bits - BigInt(c))) & 1n) === 1n;
+          if (count === 1) this.of = ((r >> (bits - 1n)) & 1n) !== (this.cf ? 1n : 0n);
+          break;
+        }
+        case "ror": {
+          const c = count % Number(bits);
+          if (c === 0) break;
+          r = ((a >> BigInt(c)) | (a << (bits - BigInt(c)))) & mask;
+          this.cf = ((r >> (bits - 1n)) & 1n) === 1n;
+          if (count === 1) this.of = ((r >> (bits - 1n)) & 1n) !== ((r >> (bits - 2n)) & 1n);
+          break;
+        }
         case "shl": case "sal": r = (a << BigInt(count)) & mask; this.cf = count>0 && ((a >> (bits - BigInt(count))) & 1n)===1n; break;
         case "shr": r = a >> BigInt(count); this.cf = count>0 && ((a >> BigInt(count-1)) & 1n)===1n; break;
         case "sar": {
@@ -838,8 +936,11 @@ export class JsInterpreter {
         }
         default: r = a;
       }
-      this.zf = r === 0n;
-      this.sf = (r & signBit) !== 0n;
+      if (!noSZ) {
+        this.zf = r === 0n;
+        this.sf = (r & signBit) !== 0n;
+        this.pf = evenParity8(r);
+      }
       this.storeOp(rm, size, r);
       return;
     }
@@ -940,7 +1041,7 @@ export class JsInterpreter {
     // marshalling. Integer labs never observe XMM values, so a tiny opaque
     // model keeps the instruction stream exact: each xmm holds one 128-bit BigInt,
     // GPR<->XMM transfers are modeled faithfully where needed.
-    const sseSet = new Set([0x10,0x11,0x28,0x29,0x6e,0x6f,0x7e,0x7f,0x57,0x5f,0x14,0x15,0x16,0x2a,0x2c,0x2d,0x2e,0x51,0x58,0x59,0x5c,0x5d,0x5e,0x54,0x55,0x56,0x5a,0x5b,0xc2,0x12,0x13]);
+    const sseSet = new Set([0x10,0x11,0x28,0x29,0x6e,0x6f,0x7e,0x7f,0x57,0x5f,0x14,0x15,0x16,0x2a,0x2c,0x2d,0x2e,0x51,0x58,0x59,0x5c,0x5d,0x5e,0x54,0x55,0x56,0x5a,0x5b,0xc2,0x12,0x13,0xef]);
     if (sseSet.has(op)) {
       this.xmm = this.xmm ?? new Array(16).fill(0n);
       const { mod, reg, rm } = this.decodeModrm(opsize);
@@ -967,6 +1068,9 @@ export class JsInterpreter {
         else this.storeMem((rm.addr ?? 0n)&M64, 16, v);
       } else if (op === 0x57) { // xorps/xorpd
         this.xmm[reg] = reg === (rm.reg ?? -1) ? 0n : (this.xmm[reg] ?? 0n) ^ (this.xmm[rm.reg ?? 0] ?? 0n);
+      } else if (op === 0xef) { // pxor xmm, xmm/m128 — exact in the BigInt model
+        const b = mod === 3 ? (this.xmm[rm.reg ?? 0] ?? 0n) : this.loadMem((rm.addr ?? 0n) & M64, 16);
+        this.xmm[reg] = (this.xmm[reg] ?? 0n) ^ b;
       } else if (op === 0x5f) { // maxps — treat as opaque move for coverage (not needed for correctness)
         if (mod !== 3) this.xmm[reg] = this.loadMem((rm.addr ?? 0n)&M64, 16);
       } else {
@@ -979,10 +1083,123 @@ export class JsInterpreter {
     // Generic SSE fallback: any other 0F * with ModRM where integer flags unchanged —
     // decode to keep stream aligned instead of throwing. Handles 0F 16 etc that
     // appear in MSVC memsets and string ops.
+    //
+    // NEVER route system instructions here: 0F 30-35 (WRMSR/RDTSC/RDMSR/
+    // RDPMC/SYSENTER/SYSEXIT) and the 0F 24-27/36-37 holes have NO ModRM, so
+    // "decoding" one eats the next real opcode byte and desyncs the whole
+    // stream (observed: an RDTSC-polling packer stub wandering into junk and
+    // dying on a bogus 0x2F). They get honest errors below instead.
+    if (op === 0x31) { // rdtsc
+      if (this.onRdtsc) {
+        const t = BigInt.asUintN(64, BigInt(this.onRdtsc()));
+        this.regs.rax = (this.regs.rax & ~0xffffffffn) | (t & 0xffffffffn);
+        this.regs.rdx = (this.regs.rdx & ~0xffffffffn) | ((t >> 32n) & 0xffffffffn);
+        return;
+      }
+      // deterministic tick derived from the step counter (legacy model)
+      const t = BigInt(this.steps) * 100n;
+      this.regs.rax = (this.regs.rax & ~0xffffffffn) | (t & 0xffffffffn);
+      this.regs.rdx = (this.regs.rdx & ~0xffffffffn) | ((t >> 32n) & 0xffffffffn);
+      return;
+    }
+    // cpuid 0f a2 — virtualized when arch.mjs is installed (no ModRM, so an
+    // unhandled CPUID must stay an honest fault rather than desync the stream)
+    if (op === 0xa2) {
+      if (!this.onCpuid) {
+        throw new CpuError(`unimplemented 0f opcode 0xa2`, this.opcodeStart ?? this.rip);
+      }
+      const r = this.onCpuid(this.regs.rax & 0xffffffffn, this.regs.rcx & 0xffffffffn) ?? {};
+      const zx = (v) => BigInt.asUintN(32, BigInt(v ?? 0));
+      this.regs.rax = zx(r.eax);
+      this.regs.rbx = zx(r.ebx);
+      this.regs.rcx = zx(r.ecx);
+      this.regs.rdx = zx(r.edx);
+      return;
+    }
+    // wrmsr 0f 30 / rdmsr 0f 32 — virtualized when arch.mjs is installed
+    if (op === 0x30 || op === 0x32) {
+      const msr = this.regs.rcx & 0xffffffffn;
+      if (op === 0x30 && this.onWrmsr) {
+        const val = ((this.regs.rdx & 0xffffffffn) << 32n) | (this.regs.rax & 0xffffffffn);
+        this.onWrmsr(msr, val);
+        return;
+      }
+      if (op === 0x32 && this.onRdmsr) {
+        const t = BigInt.asUintN(64, BigInt(this.onRdmsr(msr)));
+        this.regs.rax = (this.regs.rax & ~0xffffffffn) | (t & 0xffffffffn);
+        this.regs.rdx = (this.regs.rdx & ~0xffffffffn) | ((t >> 32n) & 0xffffffffn);
+        return;
+      }
+      throw new CpuError(`unimplemented 0f opcode 0x${op.toString(16)}`, this.opcodeStart ?? this.rip);
+    }
+    if ((op >= 0x24 && op <= 0x27) || (op >= 0x30 && op <= 0x37)) {
+      throw new CpuError(`unimplemented 0f opcode 0x${op.toString(16)}`, this.opcodeStart ?? this.rip);
+    }
+    // mov to/from debug registers: 0f 23 /r (DR := r64), 0f 21 /r
+    // (r64 := DR). Lives ahead of the generic SSE fallback (0x10-0x5f
+    // would otherwise swallow these as NOPs, silently dropping DR writes
+    // that anti-debug stubs depend on). REX.R does not extend the DR
+    // selector — mask it off; DR4/DR5 alias DR6/DR7; mod must be 3.
+    // (0f 20/22 CR access stays on the generic NOP fallback below.)
+    if (op === 0x21 || op === 0x23) {
+      const { mod, reg: regRaw, rm } = this.decodeModrm(opsize);
+      const dr = regRaw & 7;
+      if (mod !== 3) throw new CpuError(`unimplemented 0f ${op.toString(16)} mem form`, this.opcodeStart ?? this.rip);
+      this.dr = this.dr ?? new Array(8).fill(0n);
+      const sel = dr === 4 ? 6 : dr === 5 ? 7 : dr;
+      if (op === 0x23) this.dr[sel] = this.readReg(rm.reg ?? 0, 8);
+      else this.writeReg(rm.reg ?? 0, 8, this.dr[sel] ?? 0n);
+      return;
+    }
     if (op >= 0x10 && op <= 0x5f && op !== 0x57) {
       // already handled a subset above; remaining treat as NOP with correct length
       try { this.decodeModrm(opsize); } catch {}
       return;
+    }
+
+    // group 15 (0f ae): fences + cache/FPU-state ops. REX.R does not
+    // extend opcode-group selectors, so mask it off before dispatch.
+    if (op === 0xae) {
+      const { mod, reg: regRaw, rm } = this.decodeModrm(opsize);
+      const reg = regRaw & 7;
+      if (mod === 3) {
+        // lfence (/5), mfence (/6), sfence (/7): ordering only — no
+        // observable effect in single-threaded deterministic emulation.
+        if (reg === 5 || reg === 6 || reg === 7) return;
+      } else if (reg === 7) {
+        // clflush m8: cache-line eviction, no emulated effect. Touch the
+        // operand so faults surface and RIP stays aligned.
+        this.loadOp(rm, 1);
+        return;
+      } else if (reg === 2 || reg === 3) {
+        // ldmxcsr/stmxcsr m32: minimal MXCSR word model (reset value 0x1f80).
+        if (this.mxcsr === undefined) this.mxcsr = 0x1f80;
+        if (reg === 2) this.mxcsr = Number(this.loadOp(rm, 4) & 0xffffffffn);
+        else this.storeOp(rm, 4, BigInt(this.mxcsr));
+        return;
+      } else if (reg === 0 || reg === 1 || reg === 4) {
+        // fxsave/fxrstor/xsave m512byte: 512-byte area stubs over the opaque
+        // xmm model (integer labs never observe XMM values, same convention
+        // as the sseSet arm). Layout: MXCSR at +24, XMM0-15 at +160.
+        // XSAVE compaction/supervisor states are not modeled.
+        this.xmm = this.xmm ?? new Array(16).fill(0n);
+        this.#resolveRm(rm);
+        const base = (rm.addr ?? 0n) & M64;
+        if (this.mxcsr === undefined) this.mxcsr = 0x1f80;
+        if (reg === 0 || reg === 4) {
+          this.storeMem(base + 24n, 4, BigInt(this.mxcsr));
+          for (let i = 0; i < 16; i++) {
+            this.storeMem(base + 160n + BigInt(i * 16), 16, this.xmm[i] ?? 0n);
+          }
+        } else {
+          this.mxcsr = Number(this.loadMem(base + 24n, 4) & 0xffffffffn);
+          for (let i = 0; i < 16; i++) {
+            this.xmm[i] = this.loadMem(base + 160n + BigInt(i * 16), 16);
+          }
+        }
+        return;
+      }
+      throw new CpuError(`unimplemented 0f ae /${reg}`, this.opcodeStart ?? this.rip);
     }
 
     // movsxd 0f 63
@@ -1007,19 +1224,54 @@ export class JsInterpreter {
       return;
     }
 
-    // bt/bts/btr/btc: 0f a3/ab/b3/bb
-    if (op === 0xa3 || op === 0xab || op === 0xb3 || op === 0xbb) {
+    // bsf/bsr: 0f bc/bd — bit scan forward/reverse. ZF=1 when the source
+    // is 0 (dest left unchanged, matching the common behavior); otherwise
+    // dest = index of the least/most significant set bit, ZF=0.
+    if (op === 0xbc || op === 0xbd) {
+      const { reg, rm } = this.decodeModrm(opsize);
+      const v = this.loadOp(rm, opsize) & ((1n << BigInt(opsize * 8)) - 1n);
+      if (v === 0n) {
+        this.zf = true;
+        return;
+      }
+      this.zf = false;
+      let idx;
+      if (op === 0xbc) {
+        idx = 0;
+        while (((v >> BigInt(idx)) & 1n) === 0n) idx++;
+      } else {
+        idx = opsize * 8 - 1;
+        while (((v >> BigInt(idx)) & 1n) === 0n) idx--;
+      }
+      this.writeReg(reg, opsize, BigInt(idx));
+      return;
+    }
+
+    // bt/bts/btr/btc: 0f a3/ab/b3/bb (bit index in a register) and
+    // 0f ba /4-/7 (bit index is an imm8). CF = tested bit; bts/btr/btc
+    // then set/clear/complement it.
+    if (op === 0xa3 || op === 0xab || op === 0xb3 || op === 0xbb || op === 0xba) {
       const { reg, rm } = this.decodeModrm(opsize);
       const base = this.loadOp(rm, opsize);
-      const bitIdx = this.readReg(reg, opsize);
+      let sub, bitIdx;
+      if (op === 0xba) {
+        sub = reg; // /4 bt /5 bts /6 btr /7 btc
+        if (sub < 4 || sub > 7) {
+          throw new CpuError(`unimplemented 0f ba /${sub}`, this.opcodeStart ?? this.rip);
+        }
+        bitIdx = BigInt(this.fetch8());
+      } else {
+        sub = op === 0xa3 ? 4 : op === 0xab ? 5 : op === 0xb3 ? 6 : 7;
+        bitIdx = this.readReg(reg, opsize);
+      }
       const bitPos = bitIdx % BigInt(opsize * 8);
       this.cf = ((base >> bitPos) & 1n) === 1n;
-      if (op !== 0xa3) {
+      if (sub !== 4) {
         const mask = 1n << bitPos;
         let nv;
-        if (op === 0xab) nv = base | mask;        // bts
-        else if (op === 0xb3) nv = base & ~mask;  // btr
-        else nv = base ^ mask;                    // btc
+        if (sub === 5) nv = base | mask;        // bts
+        else if (sub === 6) nv = base & ~mask;  // btr
+        else nv = base ^ mask;                  // btc
         this.storeOp(rm, opsize, nv);
       }
       return;
@@ -1027,6 +1279,62 @@ export class JsInterpreter {
 
     // string ops with rep prefix: A4/A5 movs, AA/AB stos are handled in
     // dispatch() (one-byte opcodes). Nothing to do here for rep.
+
+    // xadd r/m, r: 0f c0 (8-bit) / 0f c1 — temp=dest; dest=dest+src
+    // (flags per ADD); src=temp. LOCK prefix already ignored (single-threaded).
+    if (op === 0xc0 || op === 0xc1) {
+      const size = op === 0xc0 ? 1 : opsize;
+      const { reg, rm } = this.decodeModrm(size);
+      const a = this.loadOp(rm, size);
+      const b = this.readReg(reg, size);
+      const r = this.alu("add", a, b, size);
+      this.storeOp(rm, size, r);
+      this.writeReg(reg, size, a);
+      return;
+    }
+
+    // bswap r32/r64: 0f c8+rd — byte-reverses the register. REX.W widens
+    // to 64 bits, REX.B extends the register, 0x66 is ignored. Flags kept.
+    if (op >= 0xc8 && op <= 0xcf) {
+      const idx = (op - 0xc8) + (rexB ? 8 : 0);
+      const size = (ctx.rex & 8) ? 8 : 4;
+      const v = this.readReg(idx, size);
+      let r = 0n;
+      for (let i = 0; i < size; i++) r = (r << 8n) | ((v >> BigInt(8 * i)) & 0xffn);
+      this.writeReg(idx, size, r);
+      return;
+    }
+
+    // shld/shrd: 0f a4/a5 (shift left double) and 0f ac/ad (shift right
+    // double). /a4,/ac take an imm8 count; /a5,/ad take CL. Count is masked
+    // to 5 bits (6 with REX.W); count 0 leaves dest and flags untouched.
+    if (op === 0xa4 || op === 0xa5 || op === 0xac || op === 0xad) {
+      const left = op === 0xa4 || op === 0xa5;
+      const { reg, rm } = this.decodeModrm(opsize);
+      const bits = BigInt(opsize * 8);
+      const mask = (1n << bits) - 1n;
+      const countRaw = (op === 0xa4 || op === 0xac)
+        ? Number(this.fetch8())
+        : Number(this.readReg(1, 1));
+      const count = countRaw & ((ctx.rex & 8) ? 0x3f : 0x1f);
+      if (count === 0) return;
+      const dest = this.loadOp(rm, opsize);
+      const src = this.readReg(reg, opsize);
+      let r;
+      if (left) {
+        r = ((dest << BigInt(count)) | (src >> (bits - BigInt(count)))) & mask;
+        this.cf = ((dest >> (bits - BigInt(count))) & 1n) === 1n;
+        if (count === 1) this.of = ((r >> (bits - 1n)) & 1n) !== (this.cf ? 1n : 0n);
+      } else {
+        r = ((dest >> BigInt(count)) | (src << (bits - BigInt(count)))) & mask;
+        this.cf = ((dest >> BigInt(count - 1)) & 1n) === 1n;
+        if (count === 1) this.of = ((dest >> (bits - 1n)) & 1n) !== ((dest >> (bits - 2n)) & 1n);
+      }
+      this.zf = r === 0n;
+      this.sf = (r & (1n << (bits - 1n))) !== 0n;
+      this.storeOp(rm, opsize, r);
+      return;
+    }
 
     switch (op) {
       case 0xaf: { // imul r, r/m
@@ -1123,6 +1431,7 @@ export class JsInterpreter {
   /** Call a function using the Windows x64 ABI. */
   callFunction(funcAddr, args = [], shadowSpace = 32) {
     this.pausedFrame = null; // cleared unless THIS call ends paused
+    this.faultFrame = null;  // cleared unless THIS call ends on a fault
     const retAddrMarker = 0xdead0000feed0000n; // unlikely to collide with real code
     const savedStop = this.stopOnRip;
     this.regs.rsp = (this.regs.rsp & ~0xfn) - 8n; // align
@@ -1136,6 +1445,29 @@ export class JsInterpreter {
     this.rip = funcAddr & M64;
 
     this.stopOnRip = retAddrMarker;
+    return this.#runToReturn(retAddrMarker, savedStop);
+  }
+
+  /**
+   * Resume a call that previously ended in a fault (SEH CONTINUE_EXECUTION).
+   * Restores the stop marker and continues from the current registers —
+   * callers restoring a CONTEXT should assign regs/rip before calling.
+   * @returns {object|null} same result shape as callFunction, or null when
+   *   the last call did not end on a fault.
+   */
+  resumeFromFault() {
+    const ff = this.faultFrame;
+    if (!ff) return null;
+    this.faultFrame = null;
+    this.fault = null;
+    this.halted = false;
+    this.lastDebugStop = null;
+    this.stopOnRip = ff.retMarker;
+    return this.#runToReturn(ff.retMarker, ff.savedStop);
+  }
+
+  /** Shared run-until-return loop for callFunction/resumeFromFault. */
+  #runToReturn(retAddrMarker, savedStop) {
     for (;;) {
       const reason = this.run();
       if (reason === "returned") break;
@@ -1168,7 +1500,16 @@ export class JsInterpreter {
         continue;
       }
       this.stopOnRip = savedStop;
-      if (reason === "error") return { status: "fault", error: this.fault };
+      if (reason === "error") {
+        // Snapshot for a possible SEH CONTINUE_EXECUTION resume.
+        this.faultFrame = {
+          retMarker: retAddrMarker,
+          savedStop,
+          regs: { ...this.regs },
+          rip: this.rip,
+        };
+        return { status: "fault", error: this.fault };
+      }
       if (reason === "timeout") return { status: "timeout" };
       return { status: reason, rip: this.rip }; // halted / wild-return
     }

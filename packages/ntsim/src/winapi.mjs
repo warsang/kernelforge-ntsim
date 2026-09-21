@@ -15,6 +15,7 @@
 import { M64 } from "./cpu.mjs";
 import { installWinApiExt } from "./winapi-ext.mjs";
 import { API_META } from "./winapi-meta.mjs";
+import { noteBugcheck } from "./bugcheck.mjs";
 
 const STATUS_SUCCESS = 0x00000000n;
 const STATUS_NOT_IMPLEMENTED = 0xc0000001n;
@@ -467,9 +468,7 @@ export function installWinApi(kernel) {
     return STATUS_SUCCESS; // modeled waits never block
   });
   k.define("KeBugCheckEx", (code, p1, p2, p3, p4) => {
-    kernel.bugcheck = { code: ptrSizeMask(code), params: [p1, p2, p3, p4].map(ptrSizeMask) };
-    kernel.crash = { code: "0x" + ptrSizeMask(code).toString(16) };
-    kernel.cpu.halted = true;
+    noteBugcheck(kernel, code, [p1, p2, p3, p4]);
     return undefined;
   });
 
@@ -571,6 +570,18 @@ export function installWinApi(kernel) {
     if (!key) return STATUS_INVALID_PARAMETER;
     const vn = usRead(mem, valueNameVa).str;
     let entry = kernel.registry.get(key)?.get(vn);
+    // BCD element queries: synthesize typed zeros by element-ID format nibble
+    if (!entry && kernel.bcdValueForElement && key.toLowerCase().includes("\\bcd")) {
+      // The value name may be "Value"/"Element"; fall back to the element id,
+      // which is the last path component of the containing key.
+      const el = kernel.bcdValueForElement(vn) ??
+        kernel.bcdValueForElement(key.split("\\").pop());
+      if (el) {
+        kernel.registry.get(key)?.set(vn, el);
+        kernel.dbgLog.push(`[bcd] synthesized element ${vn} (type ${el.type})`);
+        entry = el;
+      }
+    }
     // For auto-created service keys, synthesize any queried value so drivers don't abort
     if (!entry && key.toLowerCase().startsWith("\\registry\\")) {
       entry = { type: 1, data: new TextEncoder().encode("1\0") };

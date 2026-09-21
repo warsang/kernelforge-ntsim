@@ -19,6 +19,12 @@ export class SparseMemory {
     /** @type {Set<string>} pages written since last checkpoint (snapshot support) */
     this.dirty = new Set();
     this.stats = { reads: 0, writes: 0, faults: 0 };
+    /** optional diagnostics hooks (diag.mjs): fire only on page misses/watch hits */
+    this.onUnmappedRead = null;
+    this.onUnmappedWrite = null;
+    /** @type {Map<string,string>|null} page key -> watch kind (driver self-reads) */
+    this.watchPages = null;
+    this.onWatchRead = null;
   }
 
   ensurePage(baseAddr) {
@@ -38,9 +44,18 @@ export class SparseMemory {
     while (done < len) {
       const off = Number(addr & PAGE_MASK);
       const chunk = Math.min(PAGE_SIZE - off, len - done);
-      const p = this.pages.get((addr & ~PAGE_MASK).toString(16));
-      if (p) out.set(p.subarray(off, off + chunk), done);
-      else this.stats.faults++;
+      const key = (addr & ~PAGE_MASK).toString(16);
+      const p = this.pages.get(key);
+      if (p) {
+        out.set(p.subarray(off, off + chunk), done);
+        if (this.watchPages !== null) {
+          const kind = this.watchPages.get(key);
+          if (kind) this.onWatchRead?.(kind, addr, chunk);
+        }
+      } else {
+        this.stats.faults++;
+        this.onUnmappedRead?.(addr, chunk);
+      }
       addr += BigInt(chunk);
       done += chunk;
     }
@@ -54,9 +69,11 @@ export class SparseMemory {
     while (done < src.length) {
       const off = Number(addr & PAGE_MASK);
       const chunk = Math.min(PAGE_SIZE - off, src.length - done);
-      const p = this.ensurePage(addr & ~PAGE_MASK);
+      const pageBase = addr & ~PAGE_MASK;
+      if (!this.pages.has(pageBase.toString(16))) this.onUnmappedWrite?.(pageBase, chunk);
+      const p = this.ensurePage(pageBase);
       p.set(src.subarray(done, done + chunk), off);
-      this.dirty.add((addr & ~PAGE_MASK).toString(16));
+      this.dirty.add(pageBase.toString(16));
       addr += BigInt(chunk);
       done += chunk;
     }

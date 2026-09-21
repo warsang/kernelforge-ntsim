@@ -12,10 +12,16 @@ import { StructTables, StructRef } from "./structs.mjs";
 import { JsInterpreter, M64 } from "./cpu.mjs";
 import { installWinApi } from "./winapi.mjs";
 import { installNotifyEngine } from "./notify.mjs";
+import { installCallbackEngine } from "./callbacks.mjs";
 import { SymbolEngine } from "./symbols.mjs";
 import { tryDispatchException } from "./seh.mjs";
 import { Mmu, TranslatedMemory } from "./paging.mjs";
 import { API_META } from "./winapi-meta.mjs";
+import { installArchVirtualization } from "./arch.mjs";
+import { installSysQuery } from "./sysquery.mjs";
+import { installDiag } from "./diag.mjs";
+import { noteBugcheck } from "./bugcheck.mjs";
+import { installBcdHive, bcdValueForElement } from "./bcd.mjs";
 
 const DEFAULT_BASES = {
   kva: 0xfffff80000000000n,
@@ -23,6 +29,7 @@ const DEFAULT_BASES = {
   thunk: 0xfffff80100000000n, // kernel API thunks
   eproc: 0xffffb80000000000n, // synthesized EPROCESS blocks
   driver: 0xfffff80200000000n, // DRIVER_OBJECT / analyzer scratch
+  user: 0x10000000n,          // pseudo user-mode buffers (IRP UserBuffer/MDLs)
 };
 
 /** Offset between the eproc base and the synthesized KTHREAD region. Chosen
@@ -124,8 +131,11 @@ export class NtKernel {
       thunk: B.thunk ?? DEFAULT_BASES.thunk,
       eproc: B.eproc ?? DEFAULT_BASES.eproc,
       driver: B.driver ?? DEFAULT_BASES.driver,
+      user: B.user ?? DEFAULT_BASES.user,
       kthrd: B.kthrd ?? ((B.eproc ?? DEFAULT_BASES.eproc) + KTHRD_REGION_STRIDE),
     };
+    /** bump cursor for pseudo user-mode VAs (IRP UserBuffer/Type3InputBuffer) */
+    this.nextUser = this.bases.user;
     this.buildName = opts.buildName ?? "synthetic-22h2";
 
     if (this.paging) {
@@ -263,6 +273,23 @@ export class NtKernel {
     this._wireApiHooks();
     installWinApi(this);
     installNotifyEngine(this);
+    installCallbackEngine(this);
+    // Architectural virtualization (CPUID/MSR/TSC/KUSD/HV page): opt-in per
+    // kernel. The analyzer enables it by default for run-any-.sys fidelity;
+    // labs keep the legacy deterministic models unless they ask for it.
+    // Must run after installWinApi so its time-API overrides win.
+    if (opts.arch) installArchVirtualization(this, opts.arch === true ? {} : opts.arch);
+    // Virtualized NtQuerySystemInformation (module list, boot env, CI policy,
+    // hypervisor page, handle tables). Supersedes the winapi-ext version and
+    // consults kernel.arch for hypervisor-mode module injection.
+    installSysQuery(this, opts.sysQuery ?? {});
+    // Analysis diagnostics (probe classifier, SEH/API telemetry, self-read
+    // watches). Cheap and event-gated; analyzer enables it by default.
+    if (opts.diag) installDiag(this, opts.diag === true ? {} : opts.diag);
+    // Boot Configuration Data hive (drivers read BCD elements as a real-boot
+    // check; queried-but-missing elements synthesize typed zeros).
+    if (opts.bcd !== false) installBcdHive(this);
+    this.bcdValueForElement = bcdValueForElement;
 
     // Seed a tiny demo hive (Qiling-style virtual registry)
     this.registrySeed("\\Registry\\Machine\\SOFTWARE\\KernelForge", {
@@ -377,9 +404,9 @@ export class NtKernel {
           try { this.mem.w64(eproc + BigInt(tokenOff), tokenVa & ~0xfn); } catch {}
         }
         this.systemTokenVa = tokenVa;
-        this.dbgLog.push(`[kdemu] System token @ 0x${tokenVa.toString(16)} (S-1-5-18) for ${systemEproc.toString(16)}`);
+        this.emitTrace({ kind: "kdemu", text: `System token @ 0x${tokenVa.toString(16)} (S-1-5-18) for ${systemEproc.toString(16)}` });
       }
-    } catch (e) { this.dbgLog.push(`[kdemu] token wiring failed: ${e.message}`); }
+    } catch (e) { this.emitTrace({ kind: "kdemu", text: `token wiring failed: ${e.message}` }); }
 
     // scenario modules visible via `lm` — kfbootkit.sys is the L1 flag target
     this.loadedDrivers.push(
@@ -417,11 +444,35 @@ export class NtKernel {
       }
       this.kuserSharedData = 0x7ffe0000n;
     }
+
+    // Arch virtualization owns timing surfaces; it primes KUSD/HVSP after the
+    // paging frame (or the flat page) exists.
+    this.arch?.ensureKusd?.();
+    this.arch?.ensureHvsp?.();
   }
 
   /** Guest-VA -> guest-PA via the MMU (null when unmapped / paging off). */
   vtop(va) {
     return this.paging ? (this.mmu.lookup(va)?.pa ?? null) : BigInt(va);
+  }
+
+  /**
+   * Deterministic physical model (KEVLAR identity): `pa` is the page number
+   * (VA >> 12), `paToVa` shifts back. Drivers that round-trip
+   * MmGetPhysicalAddress -> MmGetVirtualForPhysical stay consistent, and the
+   * MDL PFN arrays use the same numbers.
+   */
+  vaToPa(va) {
+    const a = BigInt.asUintN(64, BigInt(va));
+    if (this.paging && this.mmu) {
+      const hit = this.mmu.lookup(a);
+      if (hit) return BigInt(hit.pa) >> 12n;
+    }
+    return a >> 12n;
+  }
+
+  paToVa(pa) {
+    return BigInt.asUintN(64, BigInt(pa)) << 12n;
   }
 
   // -------------------------------------------------- threads & cross-refs
@@ -619,6 +670,23 @@ export class NtKernel {
     return addr;
   }
 
+  /**
+   * Allocate a pseudo user-mode buffer (VA below the user/kernel split).
+   * Used for IRP UserBuffer / Type3InputBuffer / MDL backing so drivers that
+   * validate the requestor side see plausible addresses. Deterministic bump.
+   */
+  allocUser(size, tag = "User") {
+    const n = Math.max(8, Number(size) || 8);
+    const addr = this.nextUser;
+    this.nextUser += (BigInt(n) + 0xfffn) & ~0xfffn;
+    if (!this.mem.hasPage?.(addr)) {
+      try { this.mem.write(addr, new Uint8Array(0x1000)); } catch { /* demand-mapped facade */ }
+    }
+    this.userAllocs = this.userAllocs ?? [];
+    this.userAllocs.push({ addr, size: n, tag });
+    return addr;
+  }
+
   /** Register a scenario-seeded block at a fixed VA (deterministic labs). */
   registerPoolBlock(addr, size, tag = "ntsm") {
     this.mem.w64(addr - 16n, POOL_MAGIC);
@@ -643,9 +711,7 @@ export class NtKernel {
     if (entry.freed) {
       if (this.poolStrict) {
         // modeled BAD_POOL_CALLER (0xC2): P1=0x7 double free-ish, P2=addr
-        this.bugcheck = { code: 0xc2n, params: [0x7n, BigInt(addr), 0n, 0n] };
-        this.crash = { code: "0xc2" };
-        this.cpu.halted = true;
+        noteBugcheck(this, 0xc2n, [0x7n, BigInt(addr), 0n, 0n]);
       } else {
         this.dbgLog.push(`[pool] double free at ${addr.toString(16)} detected`);
       }
@@ -677,9 +743,7 @@ export class NtKernel {
   raiseIrql(level) {
     if (level < this.currentIrql) {
       // real Windows: KeRaiseIrql below current = bugcheck IRQL_NOT_LESS_OR_EQUAL
-      this.bugcheck = { code: 0xan, params: [BigInt(level), 0n, 0n, 0n] };
-      this.crash = { code: "0xa" };
-      this.cpu.halted = true;
+      noteBugcheck(this, 0xan, [BigInt(level), 0n, 0n, 0n]);
       throw new Error(`KeRaiseIrql: cannot raise to ${level} below current ${this.currentIrql}`);
     }
     const old = this.currentIrql;
@@ -689,9 +753,7 @@ export class NtKernel {
 
   lowerIrql(level) {
     if (level > this.currentIrql) {
-      this.bugcheck = { code: 0xan, params: [BigInt(level), 1n, 0n, 0n] };
-      this.crash = { code: "0xa" };
-      this.cpu.halted = true;
+      noteBugcheck(this, 0xan, [BigInt(level), 1n, 0n, 0n]);
       throw new Error(`KeLowerIrql: cannot raise IRQL ${this.currentIrql} -> ${level}`);
     }
     this.currentIrql = level;
@@ -722,9 +784,7 @@ export class NtKernel {
       `nt: mov cr0, 0x${v.toString(16)} (WP=${((v >> 16n) & 1n).toString()}, was ${((old >> 16n) & 1n).toString()})`);
     if ((old & CR0_WP) !== 0n && (v & CR0_WP) === 0n && this.hvciMode) {
       this.dbgLog.push("[hvci] CR0.WP-clearing write intercepted -> CRITICAL_STRUCTURE_CORRUPTION");
-      this.bugcheck = { code: 0x109n, params: [3n, v, old, 0n] };
-      this.crash = { code: "0x109" };
-      this.cpu.halted = true;
+      noteBugcheck(this, 0x109n, [3n, v, old, 0n]);
       throw new Error("HVCI: CR0.WP-clearing write blocked (CRITICAL_STRUCTURE_CORRUPTION)");
     }
     this.cr0 = v;
@@ -812,9 +872,7 @@ export class NtKernel {
       pg.violatedAt = this.tickCount ?? 0n;
       this.dbgLog.push(
         `[pg] sweep ${pg.sweeps}: ${extraLabel} -> CRITICAL_STRUCTURE_CORRUPTION`);
-      this.bugcheck = { code: 0x109n, params: [3n, 0n, 0n, 0n] };
-      this.crash = { code: "0x109" };
-      this.cpu.halted = true;
+      noteBugcheck(this, 0x109n, [3n, 0n, 0n, 0n]);
       return true;
     }
 
@@ -824,9 +882,7 @@ export class NtKernel {
       `[pg] sweep ${pg.sweeps}: ${d.name} @ 0x${d.base.toString(16)} modified ` +
       `(byte +0x${d.firstDelta.toString(16)}: 0x${d.pristineByte.toString(16)} -> ` +
       `0x${d.liveByte.toString(16)}) -> CRITICAL_STRUCTURE_CORRUPTION`);
-    this.bugcheck = { code: 0x109n, params: [3n, d.base, BigInt(d.firstDelta), 0n] };
-    this.crash = { code: "0x109" };
-    this.cpu.halted = true;
+    noteBugcheck(this, 0x109n, [3n, d.base, BigInt(d.firstDelta), 0n]);
     return true;
   }
 
@@ -1070,9 +1126,7 @@ export class NtKernel {
     const starved = this.pendingDpcs.filter((d) => !d.drained).length;
     if (!pinned.length && !core0Above) return { ok: true, pinned, starved };
     const worst = pinned.length ? pinned[0].irql : (this.currentIrql ?? 2);
-    this.bugcheck = { code: 0x133n, params: [BigInt(worst), 0n, 0n, 0n] };
-    this.crash = { code: "0x133" };
-    this.cpu.halted = true;
+    noteBugcheck(this, 0x133n, [BigInt(worst), 0n, 0n, 0n]);
     this.dbgLog.push("nt: KiProcessExpiredTimerList: DPC_WATCHDOG_VIOLATION (0x133): core(s) pinned at/above DISPATCH_LEVEL");
     return { ok: false, pinned, starved };
   }
@@ -1204,10 +1258,10 @@ export class NtKernel {
         this.mem.w64(entryVa + 8n, 0x1fffffn); // GrantedAccess
       }
       // Also ensure System entry at idx 1 (pid 4 -> handle 0x10 -> idx 4) is present
-      this.dbgLog.push(`[kdemu] PspCidTable HANDLE_TABLE @ 0x${htVa.toString(16)} TableCode 0x${entriesVa.toString(16)} entries for ${seen.size} processes`);
+      this.emitTrace({ kind: "kdemu", text: `PspCidTable HANDLE_TABLE @ 0x${htVa.toString(16)} TableCode 0x${entriesVa.toString(16)} entries for ${seen.size} processes` });
       return htVa;
     } catch (e) {
-      this.dbgLog.push(`[kdemu] PspCidTable creation failed: ${e.message}`);
+      this.emitTrace({ kind: "kdemu", text: `PspCidTable creation failed: ${e.message}` });
       const fallback = this.allocPool(0x40, "HndT");
       this.mem.w64(fallback, 0n);
       return fallback;
@@ -1434,6 +1488,7 @@ export class NtKernel {
             if (ret === undefined) this.cpu.regs.rax = 0n;
             else this.cpu.regs.rax = typeof ret === "bigint" ? (ret & M64) : BigInt(ret);
           }
+          try { this.diag?.onApi?.(name, isVoid ? undefined : this.cpu.regs.rax); } catch { /* diagnostics */ }
           this.cpu.regs.rsp = (rsp + 8n) & M64; // pop return address slot
           this.cpu.rip = retAddr;
           if (this.apiTrace.length < this.apiTraceLimit) {
@@ -1481,12 +1536,17 @@ export class NtKernel {
   callFunctionSeh(addr, args = [], image = null) {
     const r = this.cpu.callFunction(addr, args);
     if (r.status !== "fault" || !image) return r;
+    // SEH filter/handler invocations call back into the CPU and clear the
+    // backend's fault frame; keep the original so CONTINUE_EXECUTION can
+    // resume the outer call afterwards.
+    const savedFaultFrame = this.cpu.faultFrame ?? null;
     let dispatch;
     try {
       dispatch = tryDispatchException(this, image, r.error);
     } catch {
       return r; // malformed unwind data -> report the raw fault
     }
+    this.diag?.onSeh?.(dispatch.detail, !!dispatch.handled);
     this.exceptionTrace.push({
       faultRip: "0x" + (r.error?.rip ?? 0n).toString(16),
       handled: !!dispatch.handled,
@@ -1500,6 +1560,30 @@ export class NtKernel {
       detail: dispatch.detail,
     });
     if (!dispatch.handled) return r;
+    // EXCEPTION_CONTINUE_EXECUTION: restore the (filter-patched) CONTEXT and
+    // resume the original call when the backend supports fault resumption.
+    if (dispatch.resume) {
+      const cpu = this.cpu;
+      if (typeof cpu.resumeFromFault !== "function") {
+        this.dbgLog.push("[seh] CONTINUE_EXECUTION requested but backend cannot resume");
+        return { status: "fault", error: r.error, sehHandled: true, sehDetail: dispatch.detail };
+      }
+      try {
+        if (cpu.faultFrame == null && savedFaultFrame) cpu.faultFrame = savedFaultFrame;
+        if (dispatch.resume.regs) Object.assign(cpu.regs, dispatch.resume.regs);
+        cpu.rip = BigInt(dispatch.resume.rip) & M64;
+        const resumed = cpu.resumeFromFault();
+        if (!resumed) return r;
+        return {
+          ...resumed,
+          sehHandled: true,
+          sehDetail: dispatch.detail,
+        };
+      } catch (e) {
+        this.dbgLog.push(`[seh] resume failed: ${String(e?.message ?? e)}`);
+        return { status: "fault", error: r.error, sehHandled: true, sehDetail: dispatch.detail };
+      }
+    }
     return {
       status: "ok",
       retval: dispatch.ntstatus ?? dispatch.result?.retval ?? 0n,

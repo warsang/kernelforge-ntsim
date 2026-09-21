@@ -106,9 +106,63 @@ export const IRP = {
   STACK_COUNT: 0x42,
   CURRENT_LOCATION: 0x43,
   CANCEL: 0x44,
-  USER_BUFFER: 0x70, // Tail.Overlay.UserBuffer slot used by METHOD_* direct/neo
+  USER_IOSB: 0x48,   // Tail fields (x64): UserIosb / UserEvent / UserBuffer
+  USER_EVENT: 0x50,
+  USER_BUFFER: 0x68,
   CURRENT_STACK_LOCATION: 0xb8, // self-pointer into trailing array
 };
+
+/** CTL_CODE transfer method bits (code >> 2 & 3). */
+export const IOCTL_METHOD = {
+  BUFFERED: 0,
+  IN_DIRECT: 1,
+  OUT_DIRECT: 2,
+  NEITHER: 3,
+};
+
+export const ioctlMethod = (code) => Number(BigInt.asUintN(32, BigInt(code)) & 3n);
+
+/** _IRP.Flags bits used by buffered-IO completion. */
+export const IRP_FLAGS = {
+  BUFFERED_IO: 0x10,
+  DEALLOCATE_BUFFER: 0x20,
+  INPUT_OPERATION: 0x40, // buffered data flows SystemBuffer -> UserBuffer
+};
+
+/** IO_STACK_LOCATION.Control invoke bits (IoSetCompletionRoutine). */
+export const SL_INVOKE = {
+  ON_SUCCESS: 0x80,
+  ON_ERROR: 0x40,
+  ON_CANCEL: 0x20,
+};
+
+/** _MDL (x64) offsets + flags. PFN array follows the 0x30-byte header. */
+export const MDL = {
+  NEXT: 0x00,
+  SIZE: 0x08,
+  FLAGS: 0x0a,
+  PROCESS: 0x10,
+  MAPPED_SYSTEM_VA: 0x18,
+  START_VA: 0x20,
+  BYTE_COUNT: 0x28,
+  BYTE_OFFSET: 0x2c,
+  PFN_ARRAY: 0x30,
+  FLAG_MAPPED_TO_SYSTEM_VA: 0x0004,
+  FLAG_PAGES_LOCKED: 0x0002,
+  FLAG_SOURCE_IS_NONPAGED_POOL: 0x0008,
+};
+
+/** Initialize an _MDL describing [virtAddr, virtAddr+len). */
+export function initMdl(mem, mdl, virtAddr, len, mdlFlags = 0) {
+  const pages = Math.max(1, Math.ceil(Number(len) / 0x1000));
+  mem.write(mdl, new Uint8Array(MDL.PFN_ARRAY + pages * 8));
+  mem.w16(mdl + BigInt(MDL.SIZE), MDL.PFN_ARRAY + pages * 8);
+  mem.w16(mdl + BigInt(MDL.FLAGS), mdlFlags);
+  mem.w64(mdl + BigInt(MDL.START_VA), BigInt(virtAddr) & ~0xfffn); // page-aligned
+  mem.w32(mdl + BigInt(MDL.BYTE_COUNT), Number(len) & 0xffffffff);
+  mem.w32(mdl + BigInt(MDL.BYTE_OFFSET), Number(BigInt(virtAddr) & 0xfffn));
+  return mdl;
+}
 
 /** _IO_STACK_LOCATION (x64) */
 export const IO_STACK_LOCATION = {
@@ -121,6 +175,7 @@ export const IO_STACK_LOCATION = {
   OUTPUT_BUFFER_LENGTH: 0x08,
   INPUT_BUFFER_LENGTH: 0x10,
   IO_CONTROL_CODE: 0x18,
+  TYPE3_INPUT_BUFFER: 0x20,
   DEVICE_OBJECT: 0x28,
   FILE_OBJECT: 0x30,
   COMPLETION_ROUTINE: 0x38,
@@ -283,12 +338,42 @@ export async function sendIrp(kernel, device, spec) {
     inputBuf = new Uint8Array(hx.match(/.{2}/g)?.map((x) => parseInt(x, 16)) ?? []);
   }
   const outputLen = Number(spec.outputLen ?? 0);
+  const isIoctl = major === IRP_MJ.DEVICE_CONTROL || major === IRP_MJ.INTERNAL_DEVICE_CONTROL;
+  const ioctl = isIoctl ? Number(BigInt.asUintN(32, BigInt(spec.ioctl ?? 0))) : 0;
+  const method = isIoctl ? ioctlMethod(ioctl) : IOCTL_METHOD.BUFFERED;
+  const inLen = inputBuf?.length ?? 0;
+  const requestorMode = spec.requestorMode === "kernel" ? 0 : 1; // UserMode default
 
-  const systemBuffer = (inputBuf || outputLen)
-    ? kernel.allocPool(Math.max(inputBuf?.length ?? 0, outputLen) || 1, "IrpB")
-    : 0n;
-  if (inputBuf && inputBuf.length) mem.write(systemBuffer, inputBuf);
-  const outSnapshotBefore = outputLen ? mem.read(systemBuffer, outputLen).slice() : null;
+  let systemBuffer = 0n;
+  let userBuffer = 0n;
+  let type3Buffer = 0n;
+  let mdl = 0n;
+  if (isIoctl && method === IOCTL_METHOD.NEITHER) {
+    // METHOD_NEITHER: Type3InputBuffer + UserBuffer are raw user VAs.
+    if (inLen) {
+      type3Buffer = kernel.allocUser(inLen, "Irp3");
+      mem.write(type3Buffer, inputBuf);
+    }
+    if (outputLen) userBuffer = kernel.allocUser(outputLen, "IrpO");
+  } else if (isIoctl && method !== IOCTL_METHOD.BUFFERED) {
+    // METHOD_IN_DIRECT / OUT_DIRECT: SystemBuffer = input, MDL = output.
+    if (inLen) {
+      systemBuffer = kernel.allocPool(inLen, "IrpB");
+      mem.write(systemBuffer, inputBuf);
+    }
+    if (outputLen) {
+      userBuffer = kernel.allocUser(outputLen, "IrpO");
+      mdl = kernel.allocPool(MDL.PFN_ARRAY + Math.ceil(outputLen / 0x1000) * 8, "Mdl ");
+      initMdl(mem, mdl, userBuffer, outputLen, 0);
+    }
+  } else {
+    // METHOD_BUFFERED (and non-IOCTL majors): one SystemBuffer holds both.
+    systemBuffer = (inputBuf || outputLen)
+      ? kernel.allocPool(Math.max(inLen, outputLen) || 1, "IrpB")
+      : 0n;
+    if (inputBuf && inLen) mem.write(systemBuffer, inputBuf);
+  }
+  const outSnapshotBefore = outputLen && systemBuffer ? mem.read(systemBuffer, outputLen).slice() : null;
 
   // ---- IRP header + stack location ---------------------------------------
   const irp = kernel.allocPool(IRP.HEADER_SIZE + IRP.STACK_SIZE, "Irp!");
@@ -296,7 +381,15 @@ export async function sendIrp(kernel, device, spec) {
   mem.w16(irp + BigInt(IRP.TYPE), 0x0006); // IRP_TYPE
   mem.w8(irp + BigInt(IRP.STACK_COUNT), 1);
   mem.w8(irp + BigInt(IRP.CURRENT_LOCATION), 1);
+  mem.w8(irp + BigInt(IRP.REQUESTOR_MODE), requestorMode);
   if (systemBuffer) mem.w64(irp + BigInt(IRP.SYSTEM_BUFFER), systemBuffer & M64);
+  if (userBuffer) mem.w64(irp + BigInt(IRP.USER_BUFFER), userBuffer & M64);
+  if (mdl) mem.w64(irp + BigInt(IRP.MDL_ADDRESS), mdl & M64);
+  if (method === IOCTL_METHOD.BUFFERED && outputLen) {
+    mem.w32(irp + BigInt(IRP.FLAGS),
+      IRP_FLAGS.BUFFERED_IO | IRP_FLAGS.DEALLOCATE_BUFFER | IRP_FLAGS.INPUT_OPERATION);
+  }
+  mem.w64(irp + BigInt(IRP.USER_IOSB), kernel.allocUser(0x10, "Iosb"));
 
   const stack = irp + BigInt(IRP.HEADER_SIZE);
   mem.w64(irp + BigInt(IRP.CURRENT_STACK_LOCATION), stack & M64);
@@ -304,10 +397,11 @@ export async function sendIrp(kernel, device, spec) {
   mem.w8(stack + BigInt(IO_STACK_LOCATION.MINOR_FUNCTION), Number(spec.minor ?? 0));
   mem.w8(stack + BigInt(IO_STACK_LOCATION.CONTROL), 0xe0); // SL_ flags typical completion bits
   mem.w64(stack + BigInt(IO_STACK_LOCATION.DEVICE_OBJECT), device.va & M64);
-  if (major === IRP_MJ.DEVICE_CONTROL || major === IRP_MJ.INTERNAL_DEVICE_CONTROL) {
+  if (isIoctl) {
     mem.w32(stack + BigInt(IO_STACK_LOCATION.OUTPUT_BUFFER_LENGTH), outputLen);
-    mem.w32(stack + BigInt(IO_STACK_LOCATION.INPUT_BUFFER_LENGTH), inputBuf?.length ?? 0);
-    mem.w32(stack + BigInt(IO_STACK_LOCATION.IO_CONTROL_CODE), Number(BigInt(spec.ioctl ?? 0)));
+    mem.w32(stack + BigInt(IO_STACK_LOCATION.INPUT_BUFFER_LENGTH), inLen);
+    mem.w32(stack + BigInt(IO_STACK_LOCATION.IO_CONTROL_CODE), ioctl);
+    if (type3Buffer) mem.w64(stack + BigInt(IO_STACK_LOCATION.TYPE3_INPUT_BUFFER), type3Buffer & M64);
   } else {
     // Parameters.Read/Write: Length@+8, Key@+0x10, ByteOffset@+0x18
     mem.w32(stack + BigInt(IO_STACK_LOCATION.PARAMETERS), Number(spec.length ?? 0));
@@ -329,12 +423,35 @@ export async function sendIrp(kernel, device, spec) {
 
   if (r.status !== "ok") return { ...r, major };
 
+  // ---- pending: let deferred work/timers complete the IRP ----------------
+  let pending = (mem.u8(stack + BigInt(IO_STACK_LOCATION.CONTROL)) & 0x1) !== 0 ||
+    mem.u8(irp + BigInt(IRP.PENDING_RETURNED)) !== 0;
+  if (pending && spec.drainPending !== false) {
+    const completedBefore = kernel.lastCompletedIrp?.va;
+    try {
+      kernel.fireDueTimers?.();
+      kernel.drainDeferred?.();
+      kernel.advanceTicks?.(1);
+    } catch { /* deferred work faults are reported via exceptionTrace */ }
+    if (kernel.lastCompletedIrp?.va === (irp & M64) && completedBefore !== (irp & M64)) {
+      pending = false;
+    }
+  }
+
   const status = mem.u32(irp + BigInt(IRP.IO_STATUS_STATUS));
   const information = mem.u64(irp + BigInt(IRP.IO_STATUS_INFORMATION));
-  const pending = (mem.u8(stack + BigInt(IO_STACK_LOCATION.CONTROL)) & 0x1) !== 0;
-  const output = outSnapshotBefore
-    ? mem.read(systemBuffer, outputLen)
-    : new Uint8Array(0);
+  // Output extraction is method-aware: buffered shares SystemBuffer; direct
+  // writes land in UserBuffer (MDL MappedSystemVa aliases StartVa); NEITHER
+  // writes straight to UserBuffer.
+  let output = new Uint8Array(0);
+  if (outputLen) {
+    if (method === IOCTL_METHOD.BUFFERED || !systemBuffer) {
+      const src = systemBuffer || userBuffer;
+      output = src ? mem.read(src, outputLen) : new Uint8Array(0);
+    } else {
+      output = mem.read(userBuffer, outputLen);
+    }
+  }
 
   return {
     status: "ok",
@@ -345,8 +462,81 @@ export async function sendIrp(kernel, device, spec) {
     pending,
     steps,
     major,
+    method,
     majorName: IRP_MJ_NAMES[major] ?? `0x${major.toString(16)}`,
+    /** buffer VAs for tests/debugger introspection */
+    buffers: {
+      system: systemBuffer, user: userBuffer, type3: type3Buffer, mdl,
+    },
+    /** completion routines invoked during dispatch (IoCompleteRequest) */
+    completions: (kernel.irpCompletions ?? []).filter((c) => c.irp === (irp & M64)),
   };
+}
+
+/**
+ * Complete an IRP the way IofCompleteRequest does:
+ *  - buffered-IRP copy-back (SystemBuffer -> UserBuffer when flags allow)
+ *  - invoke registered completion routines from the top of the stack down,
+ *    honoring SL_INVOKE_ON_SUCCESS/ERROR and stopping at
+ *    STATUS_MORE_PROCESSING_REQUIRED.
+ * Idempotent per call; callers may invoke it again after requeue (unusual).
+ */
+export function completeIrp(kernel, irpVa, priority = 0) {
+  const mem = kernel.mem;
+  const irp = BigInt.asUintN(64, BigInt(irpVa));
+  if (!irp) return undefined;
+  void priority;
+
+  const status = BigInt.asUintN(32, BigInt(mem.u32(irp + BigInt(IRP.IO_STATUS_STATUS))));
+  const information = mem.u64(irp + BigInt(IRP.IO_STATUS_INFORMATION));
+  const flags = mem.u32(irp + BigInt(IRP.FLAGS));
+  const systemBuffer = mem.u64(irp + BigInt(IRP.SYSTEM_BUFFER));
+  const userBuffer = mem.u64(irp + BigInt(IRP.USER_BUFFER));
+  if ((flags & IRP_FLAGS.BUFFERED_IO) && (flags & IRP_FLAGS.INPUT_OPERATION) &&
+      systemBuffer && userBuffer && information) {
+    const len = Math.min(Number(BigInt.asUintN(32, information)), 0x10000);
+    try { mem.write(userBuffer, mem.read(systemBuffer, len)); } catch { /* emulated fault */ }
+  }
+
+  kernel.irpCompletions = kernel.irpCompletions ?? [];
+  kernel.lastCompletedIrp = { va: irp, status, information };
+
+  const stackBase = irp + BigInt(IRP.HEADER_SIZE);
+  const current = mem.u64(irp + BigInt(IRP.CURRENT_STACK_LOCATION)) || stackBase;
+  const idx = Math.max(0, Math.min(IRP_MJ_COUNT, Math.round(Number(current - stackBase) / IRP.STACK_SIZE)));
+  for (let i = 0; i <= idx; i++) {
+    const sl = stackBase + BigInt(i * IRP.STACK_SIZE);
+    const routine = mem.u64(sl + BigInt(IO_STACK_LOCATION.COMPLETION_ROUTINE));
+    if (!routine) continue;
+    const control = mem.u8(sl + BigInt(IO_STACK_LOCATION.CONTROL));
+    const success = status < 0x80000000n;
+    const anyInvoke = (control & (SL_INVOKE.ON_SUCCESS | SL_INVOKE.ON_ERROR | SL_INVOKE.ON_CANCEL)) !== 0;
+    if (anyInvoke) {
+      const ok = (success && (control & SL_INVOKE.ON_SUCCESS)) ||
+        (!success && (control & SL_INVOKE.ON_ERROR));
+      if (!ok) continue;
+    }
+    const context = mem.u64(sl + BigInt(IO_STACK_LOCATION.CONTEXT));
+    const devObj = mem.u64(sl + BigInt(IO_STACK_LOCATION.DEVICE_OBJECT));
+    let r;
+    try {
+      r = kernel.cpu.callFunction(routine, [devObj, irp, context]);
+    } catch (e) {
+      r = { status: "fault", error: e };
+    }
+    kernel.irpCompletions.push({
+      irp, routine, context,
+      status: r.status,
+      retval: r.status === "ok" ? r.retval : undefined,
+    });
+    kernel.dbgLog.push(`[irp] completion routine 0x${routine.toString(16)} -> ${r.status}`);
+    if (r.status === "ok" && BigInt.asUintN(32, BigInt(r.retval)) === 0xc0000016n) {
+      // STATUS_MORE_PROCESSING_REQUIRED: routine owns the IRP now
+      kernel.irpMoreProcessing = irp;
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 /** Convenience: METHOD_BUFFERED DeviceIoControl. */
