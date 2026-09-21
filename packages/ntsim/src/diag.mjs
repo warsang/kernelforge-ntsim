@@ -80,8 +80,8 @@ export function installDiag(kernel, opts = {}) {
   /** Classify one memory access that reached an unmapped page. */
   state.classify = function classify(addr, size, op) {
     const a = BigInt(addr);
-    if (op === "read") state.counts.unmappedReads++;
-    else state.counts.unmappedWrites++;
+    if (op === "write") state.counts.unmappedWrites++;
+    else state.counts.unmappedReads++; // read + fetch
     const rip = BigInt(kernel.cpu.rip ?? 0n);
     const inDriver = !!state.driver && rip >= state.driver.base &&
       rip < state.driver.base + BigInt(state.driver.size);
@@ -174,6 +174,12 @@ export function installDiag(kernel, opts = {}) {
   if (opts.watchProbes !== false) {
     raw.onUnmappedRead = (addr, size) => state.classify(addr, size, "read");
     raw.onUnmappedWrite = (addr, size) => state.classify(addr, size, "write");
+    // Unicorn backend parity: its fail-open memory hook reports unmapped
+    // accesses here (JS reaches classify through the SparseMemory hooks).
+    if (kernel.cpu) {
+      kernel.cpu.onUnmappedAccess = (addr, size, kind) =>
+        state.classify(addr, size, kind ?? "read");
+    }
   }
 
   state.summary = function summary() {

@@ -115,9 +115,12 @@ export class UnicornCpuBackend {
    * @param {object} uc initialized unicorn module namespace
    */
   #dirty = new Set();
+  /** fails-open unmapped accesses (fail-open mode): (addr,size,kind)=>void */
+  onUnmappedAccess = null;
   /** pages that are backend-internal (ABI sentinels) — never pulled into sparse */
   #internal = new Set();
   #arenaEnd = null;
+  #arenaStart = 0n;
   #pendingRip = null;
   /** debugger breakpoint gate: addr -> registered hook handle */
   #debugBps = new Map();
@@ -175,8 +178,15 @@ export class UnicornCpuBackend {
 
     const arenaSize = Number(opts?.arenaSize ?? 0x2000000);
     if (arenaSize > 0) {
-      const rc = this.#rawMap(0n, BigInt(arenaSize), uc.PROT_ALL);
+      // Page 0 stays a hole on purpose: NULL-page probes are a classic
+      // anti-analysis signal (diag.mjs classifies reads at +0x00/+0x3C/+0x40
+      // as PE-header scans). With the arena covering it, Unicorn would read
+      // zeros silently and the classifier would never see the probe. The
+      // fail-open hook maps it on first touch (and reports the access).
+      const arenaStart = opts?.arenaHoleAtZero === false ? 0n : 0x1000n;
+      const rc = this.#rawMap(arenaStart, BigInt(arenaSize) - arenaStart, uc.PROT_ALL);
       if (rc === 0) {
+        this.#arenaStart = arenaStart;
         this.#arenaEnd = BigInt(arenaSize);
         // arena is managed wholesale: never per-page map/write it in syncIn,
         // but DO record writes inside it as dirty for pull-back.
@@ -190,6 +200,45 @@ export class UnicornCpuBackend {
         // page base only: syncOut pulls whole pages back into SparseMemory
         self.#dirty.add((toU64(address) & ~0xfffn).toString(16));
       }, 0, 1, 0);
+
+      // Fail-open memory (default on): JsInterpreter reads unmapped pages as
+      // zeros and materializes them on write (SparseMemory semantics). Unicorn
+      // aborts instead, so a driver that probes unmapped memory would fault on
+      // this backend and succeed on JS. Map a zero page, latch the faulting
+      // RIP, stop, and let the pump re-execute the instruction once.
+      if (opts?.failOpenMemory !== false) {
+        const onUnmapped = (_handle, type, address, size) => {
+          const addr = toU64(address);
+          const page = addr & ~0xfffn;
+          const key = page.toString(16);
+          if (self.#mapped.has(key)) {
+            // Already resident: this is a protection/NX fault, not a hole.
+            // Let it surface instead of spinning on the same instruction.
+            return;
+          }
+          try {
+            self.#ensurePageMapped(page);
+          } catch {
+            return; // alias collision / reserved: report the original fault
+          }
+          // Analysis telemetry (diag.mjs): probe classification works on JS
+          // through SparseMemory read hooks; Unicorn reports here instead.
+          try {
+            const kind = (type & uc.HOOK_MEM_WRITE_UNMAPPED) ? "write"
+              : (type & uc.HOOK_MEM_FETCH_UNMAPPED) ? "fetch" : "read";
+            self.onUnmappedAccess?.(addr, Number(size ?? 1), kind);
+          } catch { /* diagnostics must never break execution */ }
+          if (process.env.KF_DEBUG_FAILOPEN) {
+            console.error(`[failopen] mapped zero page 0x${page.toString(16)} (type ${type})`);
+          }
+          self.#pendingRip = toU64(self.engine.reg_read_i64(uc.X86_REG_RIP));
+          self.engine.emu_stop();
+        };
+        self.engine.hook_add(
+          uc.HOOK_MEM_READ_UNMAPPED | uc.HOOK_MEM_WRITE_UNMAPPED | uc.HOOK_MEM_FETCH_UNMAPPED,
+          onUnmapped, 0, 1, 0,
+        );
+      }
     }
 
     this.regs = new Proxy({}, {
@@ -313,7 +362,7 @@ export class UnicornCpuBackend {
     const ucBase = this.#ucAddrFor(base);
     const key = base.toString(16);
     if (!this.#mapped.has(key)) {
-      if (this.#arenaEnd !== null && ucBase < this.#arenaEnd) {
+      if (this.#arenaEnd !== null && ucBase >= this.#arenaStart && ucBase < this.#arenaEnd) {
         this.#mapped.add(key); // covered by the flat arena already
       } else {
         const rc = this.#rawMap(ucBase, BigInt(this.PAGE), this.uc.PROT_ALL);
@@ -378,7 +427,7 @@ export class UnicornCpuBackend {
       const key = addr.toString(16);
       if (!this.#mapped.has(key)) {
         const ucBase = this.#ucAddrFor(addr);
-        if (this.#arenaEnd === null || ucBase >= this.#arenaEnd) toMap.push(addr);
+        if (this.#arenaEnd === null || ucBase < this.#arenaStart || ucBase >= this.#arenaEnd) toMap.push(addr);
         this.#mapped.add(key);
       }
       if (this.mem.hasPage(addr)) toPush.push(addr);
@@ -527,7 +576,17 @@ export class UnicornCpuBackend {
       }
       const begin = pending ?? toU64(this.regs.rip);
       const resumedFromHook = pending !== null;
-      const rc = this.#rawStart(begin, chunk);
+      let rc;
+      try {
+        rc = this.#rawStart(begin, chunk);
+      } catch (e) {
+        // WASM-side errors (TCG buffer exhaustion, malformed translations)
+        // must not take down the whole analysis: surface as a CPU fault.
+        const rip = toU64(this.regs.rip);
+        this.fault = new CpuError(
+          `unicorn engine error: ${e?.message ?? e} @ rip=0x${rip.toString(16)}`, rip);
+        return "fault";
+      }
       if (process.env.KF_DEBUG_PUMP) console.error(`[pump] iter rip=${toU64(this.regs.rip).toString(16)} rc=${rc} steps=${this.steps}`);
       // hook-stopped runs exit early: charge nothing (count is a cap, not actual)
       const stoppedByHook = rc === 0 && isDone();
@@ -540,6 +599,9 @@ export class UnicornCpuBackend {
         this.steps += resumedFromHook ? HOOK_STOP_STEP_COST : chunk;
       }
       if (rc === 0) continue;
+      // Fail-open memory latched a retry RIP (unmapped page mapped + stopped):
+      // resume even though uc_emu_start reports the original fault code.
+      if (this.#pendingRip !== null) continue;
       // Resumable debugger breakpoints: JsInterpreter continues past
       // int3/int-2d, so Unicorn must too (engine parity).
       const resume = this.#resumePastBreak(rc);
@@ -632,7 +694,14 @@ export class UnicornCpuBackend {
     const start = toU64(this.regs.rip);
     this.#pendingRip = null;      // fresh start: drop any stale RIP latch
     this.#syncIn();
-    const rc = this.#rawStart(start, 1);
+    let rc;
+    try {
+      rc = this.#rawStart(start, 1);
+    } catch (e) {
+      this.fault = new CpuError(
+        `unicorn engine error: ${e?.message ?? e} @ rip=0x${start.toString(16)}`, start);
+      throw this.fault;
+    }
     this.#takePendingRip();       // syncIn may have re-latched; read live EIP
     this.#syncOut();
     if (rc !== 0 && rc !== undefined && rc !== null && !this.engine.emu_halted?.()) {

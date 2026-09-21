@@ -1046,33 +1046,37 @@ export class JsInterpreter {
       this.xmm = this.xmm ?? new Array(16).fill(0n);
       const { mod, reg, rm } = this.decodeModrm(opsize);
       // normalize rexR extension (decodeModrm already applied REX.R to reg)
+      // NOTE: loadOp/storeOp resolve RIP-relative ModRM operands against the
+      // post-instruction RIP; using rm.addr directly read address 0 for every
+      // `movups xmm, [rip+disp]` (silent zeros, wrong XMM content, false
+      // probe telemetry).
       if (op === 0x10 || op === 0x28) { // movups/movaps/movaps reg <- rm
-        this.xmm[reg] = mod === 3 ? this.xmm[rm.reg ?? 0] : this.loadMem((rm.addr ?? 0n) & M64, 16);
+        this.xmm[reg] = mod === 3 ? this.xmm[rm.reg ?? 0] : this.loadOp(rm, 16);
       } else if (op === 0x11 || op === 0x29) { // movups/movaps rm <- reg
         const v = this.xmm[reg] ?? 0n;
         if (mod === 3) this.xmm[rm.reg ?? 0] = v;
-        else this.storeMem((rm.addr ?? 0n) & M64, 16, v);
+        else this.storeOp(rm, 16, v);
       } else if (op === 0x6e) { // movd/movq xmm, r/m (32/64)
-        const src = mod === 3 ? this.readReg(rm.reg ?? 0, opsize===8?8:4) : this.loadMem((rm.addr ?? 0n)&M64, opsize===8?8:4);
+        const src = mod === 3 ? this.readReg(rm.reg ?? 0, opsize===8?8:4) : this.loadOp(rm, opsize===8?8:4);
         // zero-extend into xmm (low 32/64 bits)
         this.xmm[reg] = src & ((1n<<64n)-1n);
       } else if (op === 0x7e) { // movd/movq r/m, xmm
         const v = this.xmm[reg] ?? 0n;
         if (mod === 3) this.writeReg(rm.reg ?? 0, opsize===8?8:4, v);
-        else this.storeMem((rm.addr ?? 0n)&M64, opsize===8?8:4, v);
+        else this.storeOp(rm, opsize===8?8:4, v);
       } else if (op === 0x6f) { // movdqa xmm, xmm/m128
-        this.xmm[reg] = mod === 3 ? this.xmm[rm.reg ?? 0] : this.loadMem((rm.addr ?? 0n)&M64, 16);
+        this.xmm[reg] = mod === 3 ? this.xmm[rm.reg ?? 0] : this.loadOp(rm, 16);
       } else if (op === 0x7f) { // movdqa m128/xmm, xmm
         const v = this.xmm[reg] ?? 0n;
         if (mod === 3) this.xmm[rm.reg ?? 0] = v;
-        else this.storeMem((rm.addr ?? 0n)&M64, 16, v);
+        else this.storeOp(rm, 16, v);
       } else if (op === 0x57) { // xorps/xorpd
         this.xmm[reg] = reg === (rm.reg ?? -1) ? 0n : (this.xmm[reg] ?? 0n) ^ (this.xmm[rm.reg ?? 0] ?? 0n);
       } else if (op === 0xef) { // pxor xmm, xmm/m128 — exact in the BigInt model
-        const b = mod === 3 ? (this.xmm[rm.reg ?? 0] ?? 0n) : this.loadMem((rm.addr ?? 0n) & M64, 16);
+        const b = mod === 3 ? (this.xmm[rm.reg ?? 0] ?? 0n) : this.loadOp(rm, 16);
         this.xmm[reg] = (this.xmm[reg] ?? 0n) ^ b;
       } else if (op === 0x5f) { // maxps — treat as opaque move for coverage (not needed for correctness)
-        if (mod !== 3) this.xmm[reg] = this.loadMem((rm.addr ?? 0n)&M64, 16);
+        if (mod !== 3) this.xmm[reg] = this.loadOp(rm, 16);
       } else {
         // generic SSE op that doesn't affect integer state: just consume ModRM and treat as NOP
         // (keeps RIP aligned; xmm already decoded)
