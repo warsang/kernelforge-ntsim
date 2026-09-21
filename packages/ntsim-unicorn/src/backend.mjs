@@ -81,6 +81,33 @@ const HOOK_STOP_STEP_COST = 256;
 const toI64 = (v) => BigInt.asIntN(64, BigInt(v));
 const toU64 = (v) => BigInt.asUintN(64, BigInt(v));
 
+/**
+ * Group ascending guest page bases into [start, end) runs that are also
+ * contiguous in unicorn space (alias folding can split them), capped at
+ * maxPages per run so bulk transfers stay bounded.
+ */
+function coalescedRuns(pages, ucAddrFor, pageSize, maxPages = 1024) {
+  const runs = [];
+  let s = null, prev = null, prevUc = null, n = 0;
+  const flush = () => {
+    if (s !== null) runs.push([s, prev + BigInt(pageSize)]);
+    s = prev = prevUc = null;
+    n = 0;
+  };
+  for (const a of pages) {
+    const uc = ucAddrFor(a);
+    if (s === null) { s = prev = a; prevUc = uc; n = 1; continue; }
+    if (a === prev + BigInt(pageSize) && uc === prevUc + BigInt(pageSize) && n < maxPages) {
+      prev = a; prevUc = uc; n++;
+    } else {
+      flush();
+      s = prev = a; prevUc = uc; n = 1;
+    }
+  }
+  flush();
+  return runs;
+}
+
 export class UnicornCpuBackend {
   /**
    * Use createUnicornBackend(); the constructor is sync-internal.
@@ -335,15 +362,33 @@ export class UnicornCpuBackend {
    * NtKernel.materializeModuleRange when a module joins the `lm` list so the
    * image is readable/executable immediately instead of waiting for a run's
    * demand sync. Idempotent — already-mapped pages are skipped.
+   *
+   * Contiguous pages are coalesced into single uc_mem_map / bulk-write
+   * calls: per-page ccalls degrade super-linearly as the mapped-region
+   * count grows (mapping an 11k-page driver image page-by-page stalled
+   * for minutes). Holes keep prior unicorn-side content (only resident
+   * sparse pages are pushed).
    */
   mapRange(base, size) {
     let addr = toU64(BigInt(base)) & ~0xfffn;
     const end = addr + toU64(BigInt(size));
+    const toMap = [];  // guest page bases needing uc_mem_map
+    const toPush = []; // guest page bases with resident sparse content
     for (; addr < end; addr += BigInt(this.PAGE)) {
-      this.#ensurePageMapped(addr);
-      if (this.mem.hasPage(addr)) {
-        this.#rawWrite(addr, this.mem.read(addr, this.PAGE));
+      const key = addr.toString(16);
+      if (!this.#mapped.has(key)) {
+        const ucBase = this.#ucAddrFor(addr);
+        if (this.#arenaEnd === null || ucBase >= this.#arenaEnd) toMap.push(addr);
+        this.#mapped.add(key);
       }
+      if (this.mem.hasPage(addr)) toPush.push(addr);
+    }
+    for (const [s, e] of coalescedRuns(toMap, (a) => this.#ucAddrFor(a), this.PAGE)) {
+      const rc = this.#rawMap(this.#ucAddrFor(s), e - s, this.uc.PROT_ALL);
+      if (rc !== 0) throw new CpuError(`uc_mem_map failed (${rc}) @ ${s.toString(16)}`, s);
+    }
+    for (const [s, e] of coalescedRuns(toPush, (a) => this.#ucAddrFor(a), this.PAGE)) {
+      this.#rawWrite(this.#ucAddrFor(s), this.mem.read(s, Number(e - s)));
     }
   }
 
@@ -632,7 +677,18 @@ export class UnicornCpuBackend {
   /** JsInterpreter lets the stack wrap below address 0; unicorn needs real pages. */
   #ensureDefaultStack() {
     const rsp = toU64(this.regs.rsp);
-    if (rsp > 0x1000n && rsp < M64 - 0x1000n) return;
+    if (rsp > 0x1000n && rsp < M64 - 0x1000n) {
+      // A wild-but-plausible RSP (e.g. a harness that derived it from the
+      // backend's untouched default) has no backing anywhere: demand-map one
+      // stack page so pushes fault honestly later instead of trapping the
+      // WASM core inside emu_start. Genuine mid-run stack misuse still
+      // surfaces through the mem hooks, not here.
+      const page = rsp & ~0xfffn;
+      if (!this.#mapped.has(page.toString(16)) && !this.mem?.hasPage?.(page)) {
+        this.#ensurePageMapped(page);
+      }
+      return;
+    }
     const base = 0x70000n;
     this.#ensureGuestScratch(base);
     this.#ensurePageMapped(base);
