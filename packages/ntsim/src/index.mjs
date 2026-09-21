@@ -8,6 +8,9 @@ export {
 } from "./paging.mjs";
 export { ServiceTable } from "./ssdt.mjs";
 export {
+  scanIntegrity, scanProcessList, scanSsdt, scanDispatchSlots,
+} from "./integrity.mjs";
+export {
   installSysQuery, collectModules, filterModules, SYSINFO,
   MODULE_INFO_SIZE, MODULE_EX_SIZE, DEFAULT_VM_BLACKLIST,
 } from "./sysquery.mjs";

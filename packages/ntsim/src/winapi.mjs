@@ -547,6 +547,9 @@ export function installWinApi(kernel) {
     }
     if (!kernel.registry.has(norm)) {
       kernel.registry.set(norm, new Map([["Dummy", { type: 1, data: new TextEncoder().encode("1\0") }]]));
+      // Emulator convenience, NOT a driver write — surfaced in limitations.
+      kernel.registryAutoCreated = kernel.registryAutoCreated ?? [];
+      if (kernel.registryAutoCreated.length < 128) kernel.registryAutoCreated.push(norm);
       const parts = norm.split("\\");
       let cur = "";
       for (let i = 1; i < parts.length; i++) {
@@ -620,13 +623,25 @@ export function installWinApi(kernel) {
 
   k.define("MmGetSystemRoutineAddress", (usNameVa) => {
     const name = usRead(mem, usNameVa).str;
+    // Structured resolution evidence for analyzer reports / state text
+    // ("resolved", "data", "provisioned" or "unresolved").
+    const recordResolution = (result, target = 0n) => {
+      kernel.apiResolutions = kernel.apiResolutions ?? new Map();
+      const cur = kernel.apiResolutions.get(name);
+      if (cur) cur.count++;
+      else kernel.apiResolutions.set(name, { name, result, target, count: 1 });
+    };
     const thunk = kernel.apiThunks.get(name);
-    if (thunk) return thunk;
+    if (thunk) {
+      recordResolution("modeled", thunk);
+      return thunk;
+    }
     // Data exports (PsInitialSystemProcess, PspCidTable, etc) are address-taken, not called
     // Return the same slot that an import would resolve to, so pattern scans find real memory
     if (name === "PsInitialSystemProcess" || name === "PspCidTable" || name === "PspCidTableLock" || name === "PsActiveProcessHead") {
       try {
         const slot = kernel.resolveImportProvisioned(`ntoskrnl!${name}`);
+        recordResolution("data", slot);
         kernel.dbgLog.push(`[winapi] MmGetSystemRoutineAddress("${name}") -> data slot 0x${slot.toString(16)}`);
         return slot;
       } catch {}
@@ -634,10 +649,12 @@ export function installWinApi(kernel) {
     // PHNT-known exports get auto-provisioned as traced stubs with correct void/ntstatus
     if (API_META.has(name)) {
       const addr = kernel.provisionUnknownApi(name);
+      recordResolution("provisioned", addr);
       kernel.dbgLog.push(`[winapi] MmGetSystemRoutineAddress("${name}") -> provisioned ${addr.toString(16)}`);
       return addr;
     }
     kernel.unsupportedExports.push(name);
+    recordResolution("unresolved", 0n);
     kernel.dbgLog.push(`[winapi] MmGetSystemRoutineAddress("${name}") -> unresolved`);
     return 0n;
   });

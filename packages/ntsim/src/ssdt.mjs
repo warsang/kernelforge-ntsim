@@ -37,7 +37,11 @@ export class ServiceTable {
     if (this.entries.length >= this.limit) {
       throw new Error(`ServiceTable: limit ${this.limit} reached`);
     }
-    const thunk = this.kernel.defineApi(apiName, impl ?? (() => 0n));
+    // Idempotent: if the export is already modeled, reuse its thunk instead of
+    // redefining it (which would clobber the real implementation with the
+    // default stub). Lets the analyzer seed a table without breaking APIs.
+    const existing = this.kernel.apiThunks.get(apiName);
+    const thunk = existing ?? this.kernel.defineApi(apiName, impl ?? (() => 0n));
     const index = this.entries.length;
     this.entries.push({ name: apiName, thunk });
     // keep memory truthful: entry i = thunk VA

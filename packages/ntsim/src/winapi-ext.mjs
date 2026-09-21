@@ -549,6 +549,18 @@ export function installWinApiExt(kernel, ctx) {
 
   // ------------------------------------------------------------ registry
 
+  /**
+   * Real driver registry mutations (as opposed to the full registry state or
+   * the analyzer's own seeding). Bounded; analyzer classifies these keys.
+   */
+  kernel.registryWriteLog = kernel.registryWriteLog ?? [];
+  /** Keys the emulator auto-created on ZwOpenKey (analysis limitation). */
+  kernel.registryAutoCreated = kernel.registryAutoCreated ?? [];
+  const logRegistryWrite = (entry) => {
+    if (kernel.registryWriteLog.length >= 512) return;
+    kernel.registryWriteLog.push(entry);
+  };
+
   const normKey = (name) => "\\" + name.replace(/^\\*/, "");
   const keyHandleFromObjAttr = (objAttr) => {
     if (!objAttr) return null;
@@ -574,6 +586,7 @@ export function installWinApiExt(kernel, ctx) {
     const info = keyHandleFromObjAttr(objAttr);
     if (!info.exists) {
       kernel.registry.set(info.key, new Map());
+      logRegistryWrite({ op: "create", key: info.key });
       if (dispositionOut) mem.w32(dispositionOut, 1); // REG_CREATED_NEW_KEY
       mem.w64(handleOut, regHandle(info.key));
     } else {
@@ -593,6 +606,10 @@ export function installWinApiExt(kernel, ctx) {
       type: Number(type) & 0xff,
       data: Uint8Array.from(mem.read(data, Number(dataLen))),
     });
+    logRegistryWrite({
+      op: "set", key, value: vn,
+      type: Number(type) & 0xff, size: Number(dataLen),
+    });
     return STATUS_SUCCESS;
   });
   k.define("NtSetValueKey", (...a) => impls.ZwSetValueKey(...a));
@@ -601,7 +618,9 @@ export function installWinApiExt(kernel, ctx) {
     const key = kernel.handles.get(ptrSizeMask(handle));
     if (!key || typeof key !== "string") return STATUS_INVALID_PARAMETER;
     const vn = usRead(mem, valueName).str;
-    return kernel.registry.get(key)?.delete(vn) ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
+    const removed = kernel.registry.get(key)?.delete(vn);
+    if (removed) logRegistryWrite({ op: "delete-value", key, value: vn });
+    return removed ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
   });
 
   k.define("ZwEnumerateValueKey", (handle, index, infoClass, infoBuf, infoLen, resultLenOut) => {
