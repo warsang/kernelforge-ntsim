@@ -1,6 +1,6 @@
 {
   "name": "@kernelforge/ntsim",
-  "version": "0.1.4",
+  "version": "0.1.8",
   "private": false,
   "type": "module",
   "main": "./src/index.mjs",

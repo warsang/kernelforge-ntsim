@@ -635,3 +635,37 @@ test("64-bit shift counts mask to 6 bits", () => {
   mem.write(0x3000n, v.b);
   assert.equal(cpu.callFunction(0x3000n).retval, 0x200000000n);
 });
+
+test("cmpxchg (0f b1): equal swaps the destination", () => {
+  const { mem, cpu } = newCpu();
+  const base = 0x2000n;
+  const c = new CodeBuf();
+  c.db(0x48).db(0xc7).db(0xc1).dd(0x1111);          // mov rcx, 0x1111
+  c.db(0x48).db(0x89).db(0x4c).db(0x24).db(0x08);    // mov [rsp+8], rcx
+  c.db(0x48).db(0xc7).db(0xc0).dd(0x1111);          // mov rax, 0x1111
+  c.db(0x48).db(0xc7).db(0xc2).dd(0x2222);          // mov rdx, 0x2222
+  c.db(0xf0);                                        // lock
+  c.db(0x48).db(0x0f).db(0xb1).db(0x54).db(0x24).db(0x08); // cmpxchg [rsp+8], rdx
+  c.db(0x48).db(0x8b).db(0x44).db(0x24).db(0x08);    // mov rax, [rsp+8]
+  c.db(0xc3);                                        // ret
+  mem.write(base, c.b);
+  const r = cpu.callFunction(base);
+  assert.equal(r.status, "ok");
+  assert.equal(r.retval, 0x2222n, "destination was swapped");
+});
+
+test("cmpxchg (0f b1): mismatch loads the accumulator with the old value", () => {
+  const { mem, cpu } = newCpu();
+  const base = 0x3000n;
+  const c = new CodeBuf();
+  c.db(0x48).db(0xc7).db(0xc1).dd(0x1111);          // mov rcx, 0x1111
+  c.db(0x48).db(0x89).db(0x4c).db(0x24).db(0x08);    // mov [rsp+8], rcx
+  c.db(0x48).db(0xc7).db(0xc0).dd(0x9999);          // mov rax, 0x9999 (mismatch)
+  c.db(0x48).db(0xc7).db(0xc2).dd(0x2222);          // mov rdx, 0x2222
+  c.db(0x48).db(0x0f).db(0xb1).db(0x54).db(0x24).db(0x08); // cmpxchg [rsp+8], rdx
+  c.db(0xc3);                                        // ret
+  mem.write(base, c.b);
+  const r = cpu.callFunction(base);
+  assert.equal(r.status, "ok");
+  assert.equal(r.retval, 0x1111n, "accumulator gets the old destination");
+});

@@ -1640,4 +1640,186 @@ export function installWinApiExt(kernel, ctx) {
     return STATUS_SUCCESS;
   });
   k.define("MmIsAddressValid", (va) => { try { return mem.canRead(BigInt(va),1) ? 1n : 0n; } catch { return 0n; } });
+
+  // ------------------------------------------------------------------------
+  // File-object / handle surface used by filter & anti-cheat drivers.
+  // FILE_OBJECT layout is the x64 one (Type/Size header, FileName at +0x30);
+  // objects are tracked host-side in kernel.fileObjects for the Flt* layer.
+  // ------------------------------------------------------------------------
+  kernel.fileObjects = kernel.fileObjects ?? new Map(); // foVa -> { path }
+  kernel.fltVolumes = kernel.fltVolumes ?? new Map();   // filter -> volume va
+  kernel.fltContexts = kernel.fltContexts ?? new Map(); // ctxVa -> { size }
+  kernel.streamContexts = kernel.streamContexts ?? new Map(); // foVa -> ctxVa
+
+  const fourCc = (tag) => {
+    try {
+      const v = Number(BigInt.asUintN(32, BigInt(tag)));
+      return String.fromCharCode(v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff);
+    } catch { return "????"; }
+  };
+
+  /** Allocate a plausible FILE_OBJECT for a path (marker + UNICODE_STRING). */
+  const createFileObject = (path) => {
+    const fo = k.alloc(0x100);
+    mem.w16(fo, 5);          // Type = IO_TYPE_FILE
+    mem.w16(fo + 2n, 0x100); // Size
+    const buf = k.alloc(Math.max(2, path.length * 2 + 2));
+    mem.writeUtf16(buf, path);
+    mem.w16(fo + 0x30n, path.length * 2);
+    mem.w16(fo + 0x32n, path.length * 2 + 2);
+    mem.w64(fo + 0x38n, buf);
+    kernel.fileObjects.set(ptrSizeMask(fo), { path });
+    return fo;
+  };
+  k._createFileObject = createFileObject;
+
+  // NTSTATUS ObReferenceObjectByHandleWithTag(HANDLE, ACCESS_MASK, POBJECT_TYPE,
+  //   KPROCESSOR_MODE, ULONG Tag, PVOID *Object, POBJECT_HANDLE_INFORMATION)
+  k.define("ObReferenceObjectByHandleWithTag", (handle, access, type, mode, tag, out, handleInfoOut) => {
+    const r = impls.ObReferenceObjectByHandle(handle, access, type, mode, out, handleInfoOut);
+    const h = ptrSizeMask(handle);
+    kernel.dbgLog.push(
+      `[ob] ObReferenceObjectByHandleWithTag(0x${h.toString(16)}, tag '${fourCc(tag)}') -> ` +
+      `${r === STATUS_SUCCESS ? "SUCCESS" : "0x" + r.toString(16)}`);
+    return r;
+  });
+
+  // NTSTATUS ObCloseHandle(HANDLE, KPROCESSOR_MODE)
+  k.define("ObCloseHandle", (handle, previousMode) => {
+    void previousMode;
+    const h = ptrSizeMask(handle);
+    let closed = kernel.handles.delete(h);
+    const list = kernel.openHandles ?? [];
+    const idx = list.findIndex((x) => x.handle === h);
+    if (idx >= 0) { list.splice(idx, 1); closed = true; }
+    if (!closed) {
+      kernel.dbgLog.push(`[ob] ObCloseHandle: unknown handle 0x${h.toString(16)}`);
+      return 0xc000000bn; // STATUS_INVALID_HANDLE
+    }
+    return STATUS_SUCCESS;
+  });
+
+  // NTSTATUS IoCreateFileEx(POBJECT_ATTRIBUTES, ACCESS_MASK, PIO_STATUS_BLOCK,
+  //   PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG, CREATE_FILE_TYPE,
+  //   PVOID, ULONG, PIO_DRIVER_CREATE_CONTEXT, PFILE_OBJECT *FileObject)
+  k.define("IoCreateFileEx", (objAttr, access, iosb, allocSize, attrs, share, disp,
+    options, eaBuf, eaLen, createType, internalParams, opts2, driverContext, fileObjectOut) => {
+    void access; void allocSize; void attrs; void share; void options; void eaBuf; void eaLen;
+    void createType; void internalParams; void opts2; void driverContext;
+    const p = pathFromObjAttr(objAttr);
+    if (!p) return STATUS_INVALID_PARAMETER;
+    const h = fileHandleSeq++;
+    kernel.handles.set(h, { __file: p });
+    if (iosb) {
+      mem.w64(iosb, STATUS_SUCCESS);
+      mem.w64(iosb + 8n, 0n); // Information
+    }
+    const fo = createFileObject(p);
+    if (fileObjectOut) mem.w64(fileObjectOut, fo);
+    kernel.dbgLog.push(
+      `[io] IoCreateFileEx("${p}", disp=${Number(disp)}) -> handle 0x${h.toString(16)}, FILE_OBJECT 0x${fo.toString(16)}`);
+    return STATUS_SUCCESS;
+  });
+
+  // NTSTATUS MmFlushImageSection(PSECTION_OBJECT_POINTERS, ULONG FlushType)
+  k.define("MmFlushImageSection", (sectionObjectPointers, flushType) => {
+    void sectionObjectPointers;
+    kernel.dbgLog.push(`[mm] MmFlushImageSection(type=${Number(flushType)}) -> SUCCESS`);
+    return STATUS_SUCCESS;
+  });
+
+  // ------------------------------------------------------------- FLTMGR
+
+  const fltVolume = (filter) => {
+    const key = ptrSizeMask(filter);
+    let vol = kernel.fltVolumes.get(key);
+    if (!vol) {
+      vol = k.alloc(0x40);
+      mem.write(vol, [0x46, 0x6c, 0x74, 0x56]); // 'FltV'
+      kernel.fltVolumes.set(key, vol);
+    }
+    return vol;
+  };
+
+  k.define("FltGetVolumeFromFileObject", (filter, fileObject, volumeOut) => {
+    void fileObject;
+    const vol = fltVolume(filter);
+    if (volumeOut) mem.w64(volumeOut, vol);
+    return STATUS_SUCCESS;
+  });
+  k.define("FltAllocateContext", (filter, contextType, contextSize, poolType, contextOut) => {
+    void filter; void poolType;
+    const size = Math.max(0x40, Number(contextSize) || 0x40);
+    const ctx = k.alloc(size);
+    mem.write(ctx, [0x46, 0x6c, 0x74, 0x43]); // 'FltC'
+    mem.w32(ctx + 4n, Number(contextType) || 0);
+    kernel.fltContexts.set(ptrSizeMask(ctx), { size });
+    if (contextOut) mem.w64(contextOut, ctx);
+    return STATUS_SUCCESS;
+  });
+  k.define("FltReleaseContext", (context) => {
+    kernel.fltContexts.delete(ptrSizeMask(context));
+    return undefined;
+  });
+  k.define("FltInitializePushLock", (pushLock) => {
+    if (pushLock) mem.w64(pushLock, 0n);
+    return undefined;
+  });
+  k.define("FltDeletePushLock", (pushLock) => { void pushLock; return undefined; });
+  k.define("FltAcquirePushLockExclusiveEx", (pushLock, flags) => { void pushLock; void flags; return undefined; });
+  k.define("FltAcquirePushLockSharedEx", (pushLock, flags) => { void pushLock; void flags; return undefined; });
+  k.define("FltReleasePushLockEx", (pushLock, flags) => { void pushLock; void flags; return undefined; });
+  k.define("FltSupportsStreamHandleContexts", (fileObject) => {
+    void fileObject;
+    return 1n; // TRUE: stream-handle contexts are supported
+  });
+  k.define("FltGetStreamHandleContext", (instance, fileObject, contextOut) => {
+    void instance;
+    const ctx = kernel.streamContexts.get(ptrSizeMask(fileObject)) ?? 0n;
+    if (contextOut) mem.w64(contextOut, ctx);
+    return ctx ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
+  });
+  k.define("FltSetStreamHandleContext", (instance, fileObject, operation, context) => {
+    void instance; void operation;
+    kernel.streamContexts.set(ptrSizeMask(fileObject), ptrSizeMask(context));
+    return STATUS_SUCCESS;
+  });
+  k.define("FltGetDestinationFileNameInformation", (instance, fileObject, rootDir, fileName,
+    fileNameLength, flags, destinationName, destBufferSize) => {
+    void instance; void fileObject; void rootDir; void fileName; void fileNameLength;
+    void flags; void destBufferSize;
+    const path = "\\Device\\HarddiskVolume1\\kfsample.tmp";
+    const buf = k.alloc(path.length * 2 + 2);
+    mem.writeUtf16(buf, path);
+    if (destinationName) {
+      mem.w16(destinationName, path.length * 2);
+      mem.w16(destinationName + 2n, path.length * 2 + 2);
+      mem.w64(destinationName + 8n, buf);
+    }
+    return STATUS_SUCCESS;
+  });
+  k.define("FltCancelFileOpen", (instance, fileObject) => {
+    void instance;
+    const rec = kernel.fileObjects.get(ptrSizeMask(fileObject));
+    if (rec) kernel.dbgLog.push(`[flt] FltCancelFileOpen("${rec.path}")`);
+    return undefined;
+  });
+
+  // ------------------------------------------------------------- Ksi* shim
+  // Vendor SDK surface (Ksi* = kernel shim helpers seen in game/anti-cheat
+  // drivers). Modeled as thin aliases over the Ke*/Ex* primitives so their
+  // routines actually run during the deferred drains.
+
+  k.define("KsiInitialize", () => STATUS_SUCCESS);
+  k.define("KsiUninitialize", () => undefined);
+  k.define("KsiInitializeSystemProcess", () => STATUS_SUCCESS);
+  k.define("KsiSystemProcess", () => kernel.findEprocessByPid(4n) ?? 0n);
+  k.define("KsiInitializeDpc", (dpc, deferred, ctx) => impls.KeInitializeDpc(dpc, deferred, ctx));
+  k.define("KsiInsertQueueDpc", (dpc, a1, a2) => impls.KeInsertQueueDpc(dpc, a1, a2));
+  k.define("KsiInitializeWorkItem", (wi, routine, ctx) => impls.ExInitializeWorkItem(wi, routine, ctx));
+  k.define("KsiQueueWorkItem", (wi, queueType) => impls.ExQueueWorkItem(wi, queueType));
+  k.define("KsiInitializeApc", (apc, thread, env, kernRoutine, rundown, normalRoutine, mode, ctx) =>
+    impls.KeInitializeApc(apc, thread, env, kernRoutine, rundown, normalRoutine, mode, ctx));
+  k.define("KsiInsertQueueApc", (apc, a1, a2, prio) => impls.KeInsertQueueApc(apc, a1, a2, prio));
+  k.define("KsiRemoveQueueApc", () => 1n);
 }

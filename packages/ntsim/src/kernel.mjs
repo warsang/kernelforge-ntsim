@@ -17,6 +17,7 @@ import { SymbolEngine } from "./symbols.mjs";
 import { tryDispatchException } from "./seh.mjs";
 import { Mmu, TranslatedMemory } from "./paging.mjs";
 import { API_META } from "./winapi-meta.mjs";
+import { SHALLOW_EXPORTS } from "./winapi-extra.mjs";
 import { installArchVirtualization } from "./arch.mjs";
 import { installSysQuery } from "./sysquery.mjs";
 import { installDiag } from "./diag.mjs";
@@ -164,6 +165,8 @@ export class NtKernel {
     this.apiTraceLimit = 8192;
     /** exports auto-provisioned as traced stubs (run-any-*.sys mode) */
     this.unmodeledExports = [];
+    /** exports modeled with meta-driven defaults only (depth bookkeeping) */
+    this.shallowStubs = [];
     /** IRQL violations (Zw or Nt exports called above APC_LEVEL) */
     this.irqlViolations = [];
     /** exception dispatch log */
@@ -1133,6 +1136,30 @@ export class NtKernel {
 
   // ------------------------------------------------------------ API surface
 
+  /**
+   * Register a shallow (meta-driven) stub: enough to be "modeled" — no
+   * unmodeled-export entry — but tracked in `shallowStubs` so reports stay
+   * honest about how deep the model actually goes.
+   */
+  defineShallowStub(name, meta = null) {
+    const existing = this.apiThunks.get(name);
+    if (existing) return existing;
+    const ret = meta?.ret ?? API_META.get(name)?.ret ?? "ntstatus";
+    const isCheck = /^(?:Is|Are|Does|FsRtlIs|KeAre)/.test(name);
+    const impl = () => {
+      switch (ret) {
+        case "void": return undefined;
+        case "boolean": return isCheck ? 0n : 1n;
+        case "pvoid": case "handle": case "ulong": case "pulong":
+        case "short": case "ushort": case "long": case "int":
+        case "char": case "wchar": case "puchar": case "puchar": return 0n;
+        default: return 0n; // ntstatus success
+      }
+    };
+    this.shallowStubs.push(name);
+    return this.defineApi(name, impl, meta ?? API_META.get(name) ?? null);
+  }
+
   defineApi(name, impl, meta) {
     if (!this.apiThunks.has(name)) {
       const thunk = this.nextThunk;
@@ -1172,7 +1199,16 @@ export class NtKernel {
   }
 
   /** Kernel data exports drivers import by address (not called through). */
-  static DATA_EXPORTS = new Set(["PsProcessType", "PsThreadType", "PsInitialSystemProcess", "PspCidTable", "PspCidTableLock", "PsActiveProcessHead"]);
+  static DATA_EXPORTS = new Set([
+    "PsProcessType", "PsThreadType", "PsInitialSystemProcess", "PspCidTable", "PspCidTableLock",
+    "PsActiveProcessHead",
+    // object types drivers import by address (ObReferenceObjectByHandle type args)
+    "IoFileObjectType", "IoDeviceObjectType", "IoDriverObjectType",
+    "ExEventObjectType", "ExDesktopObjectType", "CmKeyObjectType", "MmSectionObjectType",
+    "PsJobType", "SeTokenObjectType", "LpcPortObjectType",
+    // kernel debug flag + loaded-module list/resource
+    "KdDebuggerEnabled", "PsLoadedModuleResource", "PsLoadedModuleList",
+  ]);
 
   /**
    * Resolve "ntdll!Name"-style import; provisions when unknown.
@@ -1186,6 +1222,7 @@ export class NtKernel {
     const known = this.apiThunks.get(name);
     if (known) return known;
     if (NtKernel.DATA_EXPORTS.has(name)) return this.#dataExportSlot(name);
+    if (SHALLOW_EXPORTS.has(name)) return this.defineShallowStub(name);
     // WDF/FLTMGR/ndis-style prefixed names still get generic stubs
     return this.provisionUnknownApi(name);
   }
@@ -1199,6 +1236,14 @@ export class NtKernel {
       backing = systemEproc;
     } else if (name === "PsActiveProcessHead") {
       backing = this.PsActiveProcessHead;
+    } else if (name === "PsLoadedModuleList") {
+      backing = this.#createLoadedModuleList();
+    } else if (name === "KdDebuggerEnabled") {
+      backing = this.allocPool(4, "KdDb");
+      this.mem.w32(backing, 0); // no kernel debugger attached
+    } else if (name === "PsLoadedModuleResource") {
+      backing = this.allocPool(0x68, "ERes");
+      this.mem.write(backing, new Uint8Array(0x68));
     } else if (name === "PspCidTable") {
       backing = this.#createPspCidTable();
     } else if (name === "PspCidTableLock") {
@@ -1215,6 +1260,33 @@ export class NtKernel {
     this.dataExports.set(name, slot);
     this.dbgLog.push(`[analyzer] modeled data export ${name} @ 0x${slot.toString(16)} -> 0x${(backing & M64).toString(16)}`);
     return slot;
+  }
+
+  /**
+   * Real in-memory PsLoadedModuleList: a self-linked LIST_ENTRY head with the
+   * analyzed driver's LDR node linked in, so module walkers see something
+   * coherent instead of an unmapped pointer.
+   */
+  #createLoadedModuleList() {
+    const head = this.allocPool(0x10, "PsLm");
+    this.mem.w64(head, head);
+    this.mem.w64(head + 8n, head);
+    for (const m of this.sysQuery?.extraModules ?? []) {
+      const node = this.allocPool(0x80, "LdrE");
+      const nameBuf = this.allocPool(Math.max(2, m.name.length * 2 + 2), "LdrN");
+      this.mem.writeUtf16(nameBuf, m.name);
+      this.mem.w16(node + 0x00n, m.name.length * 2);
+      this.mem.w16(node + 0x02n, m.name.length * 2 + 2);
+      this.mem.w64(node + 0x08n, nameBuf);
+      this.mem.w64(node + 0x30n, m.base);
+      this.mem.w32(node + 0x38n, m.size);
+      const blink = this.mem.u64(head + 8n);
+      this.mem.w64(node, head);
+      this.mem.w64(node + 8n, blink);
+      this.mem.w64(blink, node);
+      this.mem.w64(head + 8n, node);
+    }
+    return head;
   }
 
   #createPspCidTable() {

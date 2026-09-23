@@ -189,3 +189,102 @@ function fakeMem() {
     },
   };
 }
+
+test("mapPe resolves imports from the ILT when the IAT is bound/garbage", () => {
+  const b = new PeBuilder();
+  b.addSection(".text", new Uint8Array(0x200).fill(0x90), 0x60000020);
+  b.addImports([
+    { dll: "KERNEL32.dll", funcs: ["CreateFileA", "WriteFile"] },
+    { dll: "ntdll.dll", funcs: ["NtClose"] },
+  ]);
+  const image = b.build(0x1000).image;
+  const pe = parsePe(image);
+  const r2o = (rva) => {
+    for (const s of pe.sections) {
+      if (rva >= s.rva && rva < s.rva + Math.max(s.virtualSize, s.rawSize)) {
+        const d = rva - s.rva;
+        if (d < s.rawSize) return s.rawPtr + d;
+        break;
+      }
+    }
+    return null;
+  };
+  // Corrupt every IAT entry the way a bound/broken import table looks: the
+  // ILT (OriginalFirstThunk) still names the imports, the IAT does not.
+  let descOff = r2o(pe.dirs[1].rva);
+  let patched = 0;
+  for (;;) {
+    const oft = u32At(image, descOff);
+    const nameRva = u32At(image, descOff + 12);
+    const ft = u32At(image, descOff + 16);
+    if (!oft && !nameRva && !ft) break;
+    const ftOff = r2o(ft);
+    for (let i = 0; i < 8; i++) {
+      const off = ftOff + i * 8;
+      const v = image[off] | (image[off + 1] << 8) | (image[off + 2] << 16) | (image[off + 3] << 24);
+      if (v === 0) break;
+      // ordinal-like garbage that is not a valid hint/name RVA
+      image[off] = 0x7d; image[off + 1] = 0x01; image[off + 2] = 0; image[off + 3] = 0;
+      image[off + 4] = 0; image[off + 5] = 0; image[off + 6] = 0; image[off + 7] = 0;
+      patched++;
+    }
+    descOff += 20;
+  }
+  assert.ok(patched >= 3, `patched ${patched} IAT entries`);
+
+  const mem = {
+    bytes: new Uint8Array(0x400000),
+    write(addr, data) { this.bytes.set(data, Number(addr)); },
+    read(addr, len) { return this.bytes.subarray(Number(addr), Number(addr) + len); },
+    u64(addr) { return BigInt(new DataView(this.bytes.buffer).getBigUint64(Number(addr), true)); },
+    w64(addr, v) { new DataView(this.bytes.buffer).setBigUint64(Number(addr), BigInt(v), true); },
+  };
+  const resolved = [];
+  const mapping = mapPe(image, mem, 0n, (name) => {
+    resolved.push(name);
+    return 0x500000n + BigInt(resolved.length * 8);
+  });
+  assert.equal(mapping.imports.length, 3);
+  assert.deepEqual(resolved, ["kernel32.dll!CreateFileA", "kernel32.dll!WriteFile", "ntdll.dll!NtClose"]);
+  assert.equal(mapping.warnings.length, 0, "ILT was clean, no bound warnings");
+});
+
+test("mapPe tolerates a garbage ILT entry instead of aborting the whole image", () => {
+  const b = new PeBuilder();
+  b.addSection(".text", new Uint8Array(0x200).fill(0x90), 0x60000020);
+  b.addImports([{ dll: "COMCTL32.dll", funcs: ["PropertySheetW", "ord381", "InitCommonControlsEx"] }]);
+  const image = b.build(0x1000).image;
+  const pe = parsePe(image);
+  const r2o = (rva) => {
+    for (const s of pe.sections) {
+      if (rva >= s.rva && rva < s.rva + Math.max(s.virtualSize, s.rawSize)) {
+        const d = rva - s.rva;
+        if (d < s.rawSize) return s.rawPtr + d;
+        break;
+      }
+    }
+    return null;
+  };
+  // Break the second ILT entry (a plain small value that is not a valid RVA).
+  const descOff = r2o(pe.dirs[1].rva);
+  const oftOff = r2o(u32At(image, descOff));
+  image[oftOff + 8] = 0x7d; image[oftOff + 9] = 0x01;
+  image[oftOff + 10] = 0; image[oftOff + 11] = 0;
+  image[oftOff + 12] = 0; image[oftOff + 13] = 0; image[oftOff + 14] = 0; image[oftOff + 15] = 0;
+
+  const mem = {
+    bytes: new Uint8Array(0x400000),
+    write(addr, data) { this.bytes.set(data, Number(addr)); },
+    read(addr, len) { return this.bytes.subarray(Number(addr), Number(addr) + len); },
+    u64(addr) { return BigInt(new DataView(this.bytes.buffer).getBigUint64(Number(addr), true)); },
+    w64(addr, v) { new DataView(this.bytes.buffer).setBigUint64(Number(addr), BigInt(v), true); },
+  };
+  const resolved = [];
+  const mapping = mapPe(image, mem, 0n, (name) => {
+    resolved.push(name);
+    return 0x500000n + BigInt(resolved.length * 8);
+  });
+  assert.equal(mapping.imports.length, 3);
+  assert.ok(resolved.some((n) => n.includes("bound:17d")), resolved.join(","));
+  assert.ok(mapping.warnings.some((w) => w.includes("bound import entry")), mapping.warnings.join(";"));
+});

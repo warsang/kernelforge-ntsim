@@ -3135,6 +3135,42 @@ export const API_META = new Map([
 export function getApiMeta(name) {
   return API_META.get(name) ?? null;
 }
+// Hand-modeled additions that are not part of the PHNT dump: minifilter
+// (FLTMGR) exports, the IoCreateFileEx/Ob*WithTag surface and the vendor
+// Ksi* shim API. Kept separate so a PHNT regeneration does not drop them.
+for (const [name, meta] of [
+  ["ObReferenceObjectByHandleWithTag", { ret: "ntstatus", header: "ntobapi.h" }],
+  ["ObCloseHandle", { ret: "ntstatus", header: "ntobapi.h" }],
+  ["IoCreateFileEx", { ret: "ntstatus", header: "ntioapi.h" }],
+  ["MmFlushImageSection", { ret: "ntstatus", header: "ntmmapi.h" }],
+  ["FltGetVolumeFromFileObject", { ret: "ntstatus", header: "fltkernel.h" }],
+  ["FltAllocateContext", { ret: "ntstatus", header: "fltkernel.h" }],
+  ["FltReleaseContext", { ret: "void", header: "fltkernel.h" }],
+  ["FltInitializePushLock", { ret: "void", header: "fltkernel.h" }],
+  ["FltDeletePushLock", { ret: "void", header: "fltkernel.h" }],
+  ["FltAcquirePushLockExclusiveEx", { ret: "void", header: "fltkernel.h" }],
+  ["FltAcquirePushLockSharedEx", { ret: "void", header: "fltkernel.h" }],
+  ["FltReleasePushLockEx", { ret: "void", header: "fltkernel.h" }],
+  ["FltSupportsStreamHandleContexts", { ret: "boolean", header: "fltkernel.h" }],
+  ["FltGetStreamHandleContext", { ret: "ntstatus", header: "fltkernel.h" }],
+  ["FltSetStreamHandleContext", { ret: "ntstatus", header: "fltkernel.h" }],
+  ["FltGetDestinationFileNameInformation", { ret: "ntstatus", header: "fltkernel.h" }],
+  ["FltCancelFileOpen", { ret: "void", header: "fltkernel.h" }],
+  ["KsiInitialize", { ret: "ntstatus", header: "ksi.h" }],
+  ["KsiUninitialize", { ret: "void", header: "ksi.h" }],
+  ["KsiInitializeSystemProcess", { ret: "ntstatus", header: "ksi.h" }],
+  ["KsiSystemProcess", { ret: "pvoid", header: "ksi.h" }],
+  ["KsiInitializeDpc", { ret: "void", header: "ksi.h" }],
+  ["KsiInsertQueueDpc", { ret: "boolean", header: "ksi.h" }],
+  ["KsiInitializeWorkItem", { ret: "void", header: "ksi.h" }],
+  ["KsiQueueWorkItem", { ret: "void", header: "ksi.h" }],
+  ["KsiInitializeApc", { ret: "void", header: "ksi.h" }],
+  ["KsiInsertQueueApc", { ret: "boolean", header: "ksi.h" }],
+  ["KsiRemoveQueueApc", { ret: "boolean", header: "ksi.h" }],
+]) {
+  if (!API_META.has(name)) API_META.set(name, meta);
+}
+
 export function isVoidApi(name) {
   const m = API_META.get(name);
   return m ? m.ret === "void" : false;

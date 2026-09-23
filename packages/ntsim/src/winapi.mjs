@@ -14,6 +14,7 @@
 
 import { M64 } from "./cpu.mjs";
 import { installWinApiExt } from "./winapi-ext.mjs";
+import { installWinApiExtra } from "./winapi-extra.mjs";
 import { API_META } from "./winapi-meta.mjs";
 import { noteBugcheck } from "./bugcheck.mjs";
 
@@ -663,4 +664,5 @@ export function installWinApi(kernel) {
   // sections, interlocked64, events/mutexes/resources, time, extended
   // strings, Se/Ob/Mm/Po/Etw/WMI/FsRtl coverage) lives in winapi-ext.mjs.
   installWinApiExt(kernel, { impls, k, usRead, usWrite: k.usWrite });
+  installWinApiExtra(kernel, { impls, k, usRead, usWrite: k.usWrite });
 }

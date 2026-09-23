@@ -129,6 +129,20 @@ export class JsInterpreter {
     this.onWrmsr = null;
     this.onRdtsc = null;
     /**
+     * SYSCALL interception (x86-64 Linux ABI): (nr, args) => retval | undefined.
+     * Returning false keeps the "no hook layer" fault; a returned value is
+     * placed in RAX and execution continues after the 2-byte syscall.
+     * @type {null | ((nr: bigint, args: bigint[]) => bigint | number | undefined | false)}
+     */
+    this.onSyscall = null;
+    /**
+     * __fastfail (int 0x29) interception: (code) => boolean|undefined.
+     * Returning anything but false marks the process as terminated instead of
+     * faulting (real __fastfail terminates the process).
+     * @type {null | ((code: number) => boolean | undefined)}
+     */
+    this.onFastfail = null;
+    /**
      * Debugger software-breakpoint gate: addresses checked BEFORE fetch.
      * A hit parks RIP on the address (nothing executes) and behaves exactly
      * like an executed int3: pendingBreak -> run()=="breakpoint". Memory is
@@ -534,6 +548,14 @@ export class JsInterpreter {
         else this.writeReg(0, 4, sx(this.regs.rax & 0xffffn, 16));
         return;
       }
+      case p === 0x99: { // cdq/cqo — sign-extend ax/eax/rax into dx/edx/rdx
+        const size = rex & 8 ? 8 : opsize;
+        const sign = 1n << BigInt(size * 8 - 1);
+        const fill = (this.regs.rax & sign) !== 0n ? (1n << BigInt(size * 8)) - 1n : 0n;
+        if (size === 8) this.regs.rdx = fill;
+        else this.writeReg(2, size, fill);
+        return;
+      }
       case p === 0xc9: this.leave(); return;
       case p === 0xc3: case p === 0xcb: this.ret(); return;
       case p === 0xe8: {
@@ -591,6 +613,35 @@ export class JsInterpreter {
         }
         return;
       }
+      case p === 0xa6 || p === 0xa7 || p === 0xae || p === 0xaf: {
+        // cmps/scas, single or rep-driven (REPE/REPNE looped here; F3 stops
+        // on ZF=0, F2 stops on ZF=1 — the classic strlen/strcmp loops)
+        const size = p === 0xa6 || p === 0xae ? 1 : opsize;
+        const step = BigInt(size) * (this.df ? -1n : 1n);
+        const mask = (1n << BigInt(size * 8)) - 1n;
+        const doOne = () => {
+          if (p === 0xa6 || p === 0xa7) {
+            const a = this.loadMem(this.regs.rsi, size);
+            const b = this.loadMem(this.regs.rdi, size);
+            this.alu("cmp", a, b, size);
+            this.regs.rsi += step; this.regs.rdi += step;
+          } else {
+            this.alu("cmp", this.regs.rax & mask, this.loadMem(this.regs.rdi, size), size);
+            this.regs.rdi += step;
+          }
+        };
+        if (rep === "rep" || rep === "repnz") {
+          while (this.regs.rcx > 0n) {
+            doOne();
+            this.regs.rcx -= 1n;
+            if (rep === "rep" && !this.zf) break;
+            if (rep === "repnz" && this.zf) break;
+          }
+        } else {
+          doOne();
+        }
+        return;
+      }
       case p === 0xcc: {
         this.pendingBreak = true;
         this.ripAfterInt3 = (this.opcodeStart ?? this.rip) + 1n;
@@ -606,13 +657,35 @@ export class JsInterpreter {
         } else if (vec === 0x29) {
           // __fastfail: GS-cookie / control-flow-guard termination. Not
           // catchable via SEH in Windows — surface a classified fault.
-          throw new CpuError("int 0x29 fastfail (__fastfail / GS failure)", this.opcodeStart ?? this.rip);
+          {
+            const code = Number(this.regs.rcx & 0xffffffffn);
+            if (typeof this.onFastfail === "function" && this.onFastfail(code) !== false) {
+              this.halted = true;
+              return;
+            }
+            throw new CpuError(`int 0x29 fastfail (__fastfail code ${code})`, this.opcodeStart ?? this.rip);
+          }
         } else {
           throw new CpuError(`unmodeled software interrupt 0x${vec.toString(16)}`, this.opcodeStart ?? this.rip);
         }
         return;
       }
       case p === 0xf4: this.halted = true; return;
+      case p === 0x9b: return; // WAIT/FWAIT — single-threaded, no-op
+      case p >= 0xd8 && p <= 0xdf: {
+        // Minimal x87: CRT startup emits FINIT (DB E3) and sometimes FCLEX
+        // (DB E2) / FNOP (D9 D0). No x87 state is modeled, so these
+        // state-reset/no-op forms execute as NOP. All other x87 forms throw
+        // an honest fault so HybridCpuBackend can rescue via Unicorn.
+        const m = this.fetch8();
+        const mod = (m >> 6) & 3;
+        if (mod === 3) {
+          if (p === 0xdb && m === 0xe3) return; // FINIT
+          if (p === 0xdb && m === 0xe2) return; // FCLEX
+          if (p === 0xd9 && m === 0xd0) return; // FNOP
+        }
+        throw new CpuError(`unimplemented x87 opcode 0x${p.toString(16)} 0x${m.toString(16)}`, this.opcodeStart);
+      }
       case p === 0xe4 || p === 0xe5: { // in al/eax, imm8
         const port = Number(this.fetch8());
         const size = p === 0xe4 ? 1 : opsize;
@@ -1284,6 +1357,26 @@ export class JsInterpreter {
     // string ops with rep prefix: A4/A5 movs, AA/AB stos are handled in
     // dispatch() (one-byte opcodes). Nothing to do here for rep.
 
+    // cmpxchg r/m, r: 0f b0 (8-bit) / 0f b1 — compares the accumulator with
+    // the destination; equal -> ZF=1, dest=src; else ZF=0, acc=dest. Common in
+    // CRT/Go/Rust atomics (lock cmpxchg); the lock prefix is ignored
+    // (single-threaded), but ZF must be exact.
+    if (op === 0xb0 || op === 0xb1) {
+      const size = op === 0xb0 ? 1 : opsize;
+      const { reg, rm } = this.decodeModrm(size);
+      const dst = this.loadOp(rm, size);
+      const src = this.readReg(reg, size);
+      const acc = this.readReg(0, size);
+      if (dst === acc) {
+        this.zf = true;
+        this.storeOp(rm, size, src);
+      } else {
+        this.zf = false;
+        this.writeReg(0, size, dst);
+      }
+      return;
+    }
+
     // xadd r/m, r: 0f c0 (8-bit) / 0f c1 — temp=dest; dest=dest+src
     // (flags per ADD); src=temp. LOCK prefix already ignored (single-threaded).
     if (op === 0xc0 || op === 0xc1) {
@@ -1363,7 +1456,20 @@ export class JsInterpreter {
         this.writeReg(reg, opsize, v & ((1n << BigInt(opsize * 8)) - 1n));
         return;
       }
-      case 0x05: throw new CpuError("syscall reached interpreter — kernel hook layer must intercept", this.opcodeStart ?? this.rip);
+      case 0x05: { // syscall — intercepted by a host layer (linux-sim / ELF harness)
+        if (typeof this.onSyscall === "function") {
+          const args = [
+            this.regs.rdi, this.regs.rsi, this.regs.rdx,
+            this.regs.r10, this.regs.r8, this.regs.r9,
+          ];
+          const res = this.onSyscall(this.regs.rax, args);
+          if (res !== false) {
+            if (res !== undefined && res !== null) this.regs.rax = BigInt.asUintN(64, BigInt(res));
+            return;
+          }
+        }
+        throw new CpuError("syscall reached interpreter — kernel hook layer must intercept", this.opcodeStart ?? this.rip);
+      }
       default:
         throw new CpuError(`unimplemented 0f opcode 0x${op.toString(16)}`, this.opcodeStart ?? this.rip);    }
   }
