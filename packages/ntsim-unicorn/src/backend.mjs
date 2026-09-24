@@ -37,6 +37,12 @@
 
 import { CpuError } from "@kernelforge/ntsim/src/cpu.mjs";
 
+/** Page-sync writes into guest memory must bypass harness region checks. */
+function writeToGuestMem(mem, addr, bytes) {
+  if (typeof mem.writeRaw === "function") return mem.writeRaw(addr, bytes);
+  return mem.write(addr, bytes);
+}
+
 // Single shared wasm module instance; initialization is async and idempotent.
 let modulePromise = null;
 async function loadModule() {
@@ -378,7 +384,7 @@ export class UnicornCpuBackend {
     for (const key of this.#mapped) {
       if (this.#internal.has(key)) continue;
       const base = BigInt("0x" + key);
-      this.mem.write(base, this.#rawRead(this.#ucAddrFor(base), this.PAGE));
+      writeToGuestMem(this.mem, base, this.#rawRead(this.#ucAddrFor(base), this.PAGE));
     }
   }
 
@@ -396,7 +402,7 @@ export class UnicornCpuBackend {
     for (const key of this.#dirty) {
       const base = BigInt("0x" + key);
       try {
-        this.mem.write(base, this.#rawRead(this.#ucAddrFor(base), this.PAGE));
+        writeToGuestMem(this.mem, base, this.#rawRead(this.#ucAddrFor(base), this.PAGE));
       } catch {
         // Dirtied but not resident unicorn-side (e.g. the write raced a
         // mid-run sparse mutation). SparseMemory already holds the truth.
@@ -860,7 +866,7 @@ export class UnicornCpuBackend {
 
     this.rip = funcAddr & M64;
     this.bpHit = null;
-    const outcome = this.#pump(10_000_000, () => returned || this.bpHit !== null);
+    const outcome = this.#pump(10_000_000, () => returned || this.bpHit !== null || this.halted);
     this.hook_del(markerHook);
 
     this.#syncOut();
