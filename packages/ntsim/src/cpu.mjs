@@ -108,6 +108,8 @@ export class JsInterpreter {
     this.steps = 0;
     /** last fault info for bugcheck reporting */
     this.fault = null;
+    /** rolling window of the last executed rips (fault post-mortems) */
+    this.ripRing = [];
     /** when set, run() returns "returned" upon reaching this rip (call sentinel) */
     this.stopOnRip = null;
     /**
@@ -177,6 +179,7 @@ export class JsInterpreter {
     this.halted = false;
     this.steps = 0;
     this.fault = null;
+    this.ripRing.length = 0;
     this.tf = false;
     this.iflag = true;
     this.inhibitWindow = 0;
@@ -447,6 +450,9 @@ export class JsInterpreter {
 
   step() {
     if (this.halted) throw new Error("cpu halted");
+    // rolling execution history for post-mortem diagnostics (fault reports)
+    this.ripRing.push(this.rip);
+    if (this.ripRing.length > 192) this.ripRing.splice(0, 128);
     // debugger breakpoint gate: park RIP on the address, report a break
     if (this.debugBps.size > 0 && this.debugBps.has(this.rip)) {
       this.steps++;
@@ -1618,7 +1624,7 @@ export class JsInterpreter {
           regs: { ...this.regs },
           rip: this.rip,
         };
-        return { status: "fault", error: this.fault };
+        return { status: "fault", error: this.fault, recentRips: [...this.ripRing] };
       }
       if (reason === "timeout") return { status: "timeout" };
       return { status: reason, rip: this.rip }; // halted / wild-return
