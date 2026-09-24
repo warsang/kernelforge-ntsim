@@ -24,7 +24,7 @@ const R64 = [
 ];
 
 const UNSUPPORTED_RE =
-  /unimplemented opcode|unimplemented 0f opcode|invalid alu form|unimplemented grp/;
+  /unimplemented (?:0f |x87 )?opcode|invalid alu form|unimplemented grp/;
 
 export class HybridCpuBackend {
   /** @type {"js"|"unicorn"} */
@@ -49,6 +49,27 @@ export class HybridCpuBackend {
   attachMemory(mem) {
     if (this.js) this.js.mem = mem;
     if (this.uc) this.uc.mem = mem;
+  }
+
+  /**
+   * Explicit range mapping (thunk region, stack, heap, module extents) must
+   * reach the unicorn child too: a later JS->unicorn handoff would otherwise
+   * execute/read unmapped pages and die with UC "memory access out of bounds"
+   * the first time a thunk (0x6000_xxxx) is touched. Idempotent.
+   */
+  mapRange(base, size) {
+    try { this.uc?.mapRange?.(base, size); } catch { /* optional backend */ }
+  }
+
+  /**
+   * Native-syscall hook. Only the JS front end runs hooks; while the session
+   * is on the JS phase syscalls are serviced there. (Syscalls reached AFTER a
+   * one-way handoff fault — Unicorn has no hook surface for them yet.)
+   */
+  get onSyscall() { return this.js?.onSyscall ?? null; }
+  set onSyscall(fn) {
+    if (this.js) this.js.onSyscall = fn;
+    if (this.uc && "onSyscall" in this.uc) this.uc.onSyscall = fn;
   }
 
   static async create(mem, opts = {}) {
